@@ -18,7 +18,7 @@ use libsignal_service::{
     prelude::{phonenumber::PhoneNumber, DeviceId, MessageSenderError, ProtobufMessage, Uuid},
     profile_cipher::ProfileCipher,
     proto::{
-        data_message::Delete,
+        data_message::{Delete, PollCreate, PollTerminate, PollVote},
         sync_message::{self, sticker_pack_operation, StickerPackOperation},
         AttachmentPointer, DataMessage, EditMessage, GroupContextV2, NullMessage, SyncMessage,
         Verified,
@@ -1275,6 +1275,140 @@ impl<S: Store> Manager<S, Registered> {
         self.store.remove_sticker_pack(pack_id).await?;
 
         Ok(())
+    }
+
+    /// Send a poll to a group
+    ///
+    /// Creates and sends a poll message to the specified group with a question and answer options.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's master key (32 bytes)
+    /// * `question` - The poll question
+    /// * `options` - Vector of answer options (up to 10)
+    /// * `allow_multiple` - Whether voters can select multiple options
+    ///
+    /// # Returns
+    /// * `Ok(u64)` - The poll's timestamp (needed for voting/terminating)
+    /// * `Err(Error)` if the send fails
+    pub async fn send_poll(
+        &mut self,
+        master_key_bytes: &[u8],
+        question: impl Into<String>,
+        options: Vec<String>,
+        allow_multiple: bool,
+    ) -> Result<u64, Error<S::Error>> {
+        let poll_create = PollCreate {
+            question: Some(question.into()),
+            allow_multiple: Some(allow_multiple),
+            options,
+        };
+
+        let data_message = DataMessage {
+            poll_create: Some(poll_create),
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key_bytes.to_vec()),
+                revision: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+
+        self.send_message_to_group(master_key_bytes, data_message, timestamp)
+            .await?;
+
+        Ok(timestamp)
+    }
+
+    /// Vote on an existing poll in a group
+    ///
+    /// Sends a vote message to the specified group poll.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's master key (32 bytes)
+    /// * `poll_author_aci` - The ACI of the poll creator
+    /// * `poll_timestamp` - The timestamp of the original poll message
+    /// * `selected_options` - Indices of selected answer options (0-based)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(Error)` if the send fails
+    pub async fn vote_on_poll(
+        &mut self,
+        master_key_bytes: &[u8],
+        poll_author_aci: Aci,
+        poll_timestamp: u64,
+        selected_options: Vec<u32>,
+    ) -> Result<(), Error<S::Error>> {
+        let vote_count = selected_options.len() as u32;
+
+        let poll_vote = PollVote {
+            target_author_aci_binary: Some(poll_author_aci.service_id_binary()),
+            target_sent_timestamp: Some(poll_timestamp),
+            option_indexes: selected_options,
+            vote_count: Some(vote_count),
+        };
+
+        let data_message = DataMessage {
+            poll_vote: Some(poll_vote),
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key_bytes.to_vec()),
+                revision: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+
+        self.send_message_to_group(master_key_bytes, data_message, timestamp)
+            .await
+    }
+
+    /// Terminate an existing poll in a group
+    ///
+    /// Closes the poll, preventing further votes. Only the poll creator can terminate a poll.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's master key (32 bytes)
+    /// * `poll_timestamp` - The timestamp of the original poll message to terminate
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(Error)` if the send fails
+    pub async fn terminate_poll(
+        &mut self,
+        master_key_bytes: &[u8],
+        poll_timestamp: u64,
+    ) -> Result<(), Error<S::Error>> {
+        let poll_terminate = PollTerminate {
+            target_sent_timestamp: Some(poll_timestamp),
+        };
+
+        let data_message = DataMessage {
+            poll_terminate: Some(poll_terminate),
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key_bytes.to_vec()),
+                revision: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+
+        self.send_message_to_group(master_key_bytes, data_message, timestamp)
+            .await
     }
 
     pub async fn send_session_reset(

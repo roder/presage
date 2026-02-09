@@ -21,7 +21,7 @@ use presage::libsignal_service::prelude::ProfileKey;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::proto::data_message::Quote;
 use presage::libsignal_service::proto::sync_message::Sent;
-use presage::libsignal_service::protocol::ServiceId;
+use presage::libsignal_service::protocol::{ServiceId};
 use presage::libsignal_service::sender::AttachmentSpec;
 use presage::libsignal_service::zkgroup::GroupMasterKeyBytes;
 use presage::model::contacts::Contact;
@@ -200,6 +200,35 @@ enum Cmd {
     SyncContacts,
     #[clap(about = "Print various statistics useful for debugging")]
     Stats,
+    #[clap(about = "Send a poll to a group")]
+    SendPoll {
+        #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
+        master_key: GroupMasterKeyBytes,
+        #[clap(long, short = 'q', help = "Poll question")]
+        question: String,
+        #[clap(long, short = 'o', action = clap::ArgAction::Append, help = "Poll option (can be repeated, 2-10 options)")]
+        options: Vec<String>,
+        #[clap(long, help = "Allow multiple selections")]
+        allow_multiple: bool,
+    },
+    #[clap(about = "Vote on a poll in a group")]
+    VoteOnPoll {
+        #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
+        master_key: GroupMasterKeyBytes,
+        #[clap(long, help = "UUID of the poll creator")]
+        poll_author_uuid: Uuid,
+        #[clap(long, help = "Timestamp of the poll message")]
+        poll_timestamp: u64,
+        #[clap(long, short = 's', help = "Selected option indices (0-based, can be repeated)", num_args = 1..)]
+        selected_options: Vec<u32>,
+    },
+    #[clap(about = "Terminate a poll in a group")]
+    TerminatePoll {
+        #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
+        master_key: GroupMasterKeyBytes,
+        #[clap(long, help = "Poll message timestamp to terminate")]
+        poll_timestamp: u64,
+    },
 }
 
 enum Recipient {
@@ -404,6 +433,35 @@ async fn print_message<S: Store>(
         }
 
         match data_message {
+            DataMessage {
+                poll_create: Some(poll), ..
+            } => {
+                let question = poll.question.as_deref().unwrap_or("<no question>");
+                let allow_multiple = poll.allow_multiple.unwrap_or(false);
+                let options = poll.options.iter()
+                    .enumerate()
+                    .map(|(i, opt)| format!("  [{}] {}", i, opt))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Some(format!(
+                    "📊 Poll: {}\n{}\n({})",
+                    question,
+                    options,
+                    if allow_multiple { "multiple choice" } else { "single choice" }
+                ))
+            }
+            DataMessage {
+                poll_vote: Some(vote), ..
+            } => {
+                let selected = vote.option_indexes.iter()
+                    .map(|i| format!("option {}", i))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!("🗳️  Voted on poll: {}", selected))
+            }
+            DataMessage {
+                poll_terminate: Some(_), ..
+            } => Some("🔒 Poll terminated".to_string()),
             DataMessage {
                 quote:
                     Some(Quote {
@@ -975,6 +1033,46 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             };
 
             println!("{stats:#?}")
+        }
+        Cmd::SendPoll {
+            master_key,
+            question,
+            options,
+            allow_multiple,
+        } => {
+            let mut manager = load_registered_and_receive(store).await?;
+
+            if options.len() < 2 {
+                bail!("Poll must have at least 2 options");
+            }
+            if options.len() > 10 {
+                bail!("Poll cannot have more than 10 options");
+            }
+
+            let poll_timestamp = manager.send_poll(&master_key, question, options, allow_multiple).await?;
+            println!("Poll sent successfully (timestamp: {})", poll_timestamp);
+        }
+        Cmd::VoteOnPoll {
+            master_key,
+            poll_author_uuid,
+            poll_timestamp,
+            selected_options,
+        } => {
+            if selected_options.is_empty() {
+                bail!("Must select at least one option");
+            }
+
+            let mut manager = load_registered_and_receive(store).await?;
+            manager.vote_on_poll(&master_key, poll_author_uuid.into(), poll_timestamp, selected_options).await?;
+            println!("Vote cast successfully");
+        }
+        Cmd::TerminatePoll {
+            master_key,
+            poll_timestamp,
+        } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            manager.terminate_poll(&master_key, poll_timestamp).await?;
+            println!("Poll terminated successfully");
         }
     }
     Ok(())

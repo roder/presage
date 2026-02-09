@@ -1892,7 +1892,7 @@ dependencies = [
 [[package]]
 name = "libsignal-service"
 version = "0.1.0"
-source = "git+https://github.com/whisperfish/libsignal-service-rs?rev=aebf60700d364541fa89449e12e29ab47921fafe#aebf60700d364541fa89449e12e29ab47921fafe"
+source = "git+https://github.com/roder/libsignal-service-rs?branch=feature%2Fprotocol-v8-polls-rebased#498c03d05bae2712bc816ef476459a92708b6a51"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2558,6 +2558,7 @@ dependencies = [
 name = "presage"
 version = "0.8.0-dev"
 dependencies = [
+ "anyhow",
  "base64",
  "bytes",
  "derive_more",
