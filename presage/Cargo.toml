@@ -7,7 +7,7 @@ edition = "2021"
 license = "AGPL-3.0-only"
 
 [dependencies]
-libsignal-service = { git = "https://github.com/roder/libsignal-service-rs", branch = "feature/protocol-v8-polls-rebased" }
+libsignal-service = { git = "https://github.com/roder/libsignal-service-rs", branch = "main" }
 
 base64 = "0.22"
 futures = "0.3"
