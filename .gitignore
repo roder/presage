@@ -11,3 +11,9 @@
 
 # VSCode debugger config
 .vscode/launch.json
+
+# Gas Town (added by gt)
+.runtime/
+.claude/
+.beads/
+.logs/
