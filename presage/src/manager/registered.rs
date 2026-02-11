@@ -703,6 +703,7 @@ impl<S: Store> Manager<S, Registered> {
                                                 }
                                             }
                                             RequestType::Blocked => {
+                                                warn!("storing blocked user is not implemented yet! we will not report blocked users to the device requesting the sync.");
                                                 let result = state.message_sender.send_sync_message(SyncMessage {
                                                     blocked: Some(libsignal_service::content::sync_message::Blocked {
                                                         numbers: vec![],
@@ -716,7 +717,6 @@ impl<S: Store> Manager<S, Registered> {
                                                     warn!(%error, "Error sending blocked contacts to other devices");
                                                 }
                                             }
-                                            // TODO: Configuration
                                             t => {
                                                 info!(type = ?t, "Got sync request of currently unhandled type")
                                             }
