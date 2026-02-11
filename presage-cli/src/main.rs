@@ -233,22 +233,22 @@ enum Cmd {
     CreateGroup {
         #[clap(long, help = "Title of the group")]
         title: String,
-        #[clap(long, help = "Member UUIDs to add (can be repeated)", action = clap::ArgAction::Append)]
-        member: Vec<Uuid>,
+        #[clap(long, short = 'u', help = "Member UUIDs to add (can be repeated)", action = clap::ArgAction::Append)]
+        uuid: Vec<Uuid>,
     },
-    #[clap(about = "Add a member to an existing group")]
+    #[clap(about = "Add members to an existing group")]
     AddMember {
         #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
         master_key: GroupMasterKeyBytes,
-        #[clap(long, short = 'u', help = "UUID of the member to add")]
-        uuid: Uuid,
+        #[clap(long, short = 'u', help = "UUID of the member to add (can be repeated)", action = clap::ArgAction::Append)]
+        uuid: Vec<Uuid>,
     },
-    #[clap(about = "Remove a member from an existing group")]
+    #[clap(about = "Remove members from an existing group")]
     RemoveMember {
         #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
         master_key: GroupMasterKeyBytes,
-        #[clap(long, help = "UUID of the member to remove")]
-        uuid: Uuid,
+        #[clap(long, short = 'u', help = "UUID of the member to remove (can be repeated)", action = clap::ArgAction::Append)]
+        uuid: Vec<Uuid>,
     },
 }
 
@@ -1095,25 +1095,13 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             manager.terminate_poll(&master_key, poll_timestamp).await?;
             println!("Poll terminated successfully");
         }
-        Cmd::CreateGroup { title, member } => {
+        Cmd::CreateGroup { title, uuid } => {
             let mut manager = load_registered_and_receive(store).await?;
 
-            // Fetch profile keys for all members from contacts
             let mut members_with_keys = Vec::new();
-            for uuid in member {
-                let contact = manager
-                    .store()
-                    .contact_by_id(&uuid)
-                    .await?
-                    .ok_or_else(|| anyhow!("Contact not found for UUID: {}", uuid))?;
-
-                let profile_key_bytes: [u8; 32] = contact
-                    .profile_key
-                    .try_into()
-                    .map_err(|_| anyhow!("Profile key is not 32 bytes or empty for uuid: {}", uuid))?;
-
-                let profile_key = ProfileKey::create(profile_key_bytes);
-                members_with_keys.push((uuid.into(), profile_key));
+            for member_uuid in &uuid {
+                let profile_key = find_profile_key(&manager, member_uuid).await?;
+                members_with_keys.push(((*member_uuid).into(), profile_key));
             }
 
             let master_key = manager.create_group(title, members_with_keys).await?;
@@ -1123,49 +1111,59 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
         Cmd::AddMember { master_key, uuid } => {
             let mut manager = load_registered_and_receive(store).await?;
 
-            // Look up profile key: contacts -> profile_keys store -> group memberships
-            let from_contact = manager
-                .store()
-                .contact_by_id(&uuid)
-                .await?
-                .and_then(|c| <Vec<u8> as TryInto<[u8; 32]>>::try_into(c.profile_key).ok())
-                .map(ProfileKey::create);
-
-            let profile_key = if let Some(pk) = from_contact {
-                pk
-            } else {
-                let aci: presage::libsignal_service::protocol::Aci = uuid.into();
-                let service_id: ServiceId = aci.into();
-                if let Some(pk) = manager.store().profile_key(&service_id).await? {
-                    pk
-                } else {
-                    // Search group memberships for the profile key
-                    let target_aci: presage::libsignal_service::protocol::Aci = uuid.into();
-                    let mut found = None;
-                    for result in manager.store().groups().await? {
-                        let (_key, group) = result?;
-                        if let Some(member) = group.members.iter().find(|m| m.aci == target_aci) {
-                            found = Some(member.profile_key);
-                            break;
-                        }
-                    }
-                    found.ok_or_else(|| anyhow!(
-                        "No profile key found for {}. Ensure the user is a contact or group member.",
-                        uuid
-                    ))?
-                }
-            };
-
-            manager.add_group_member(&master_key, uuid.into(), profile_key).await?;
-            println!("Member added successfully!");
+            for member_uuid in &uuid {
+                let profile_key = find_profile_key(&manager, member_uuid).await?;
+                manager.add_group_member(&master_key, (*member_uuid).into(), profile_key).await?;
+                println!("Member {} added successfully!", member_uuid);
+            }
         }
         Cmd::RemoveMember { master_key, uuid } => {
             let mut manager = load_registered_and_receive(store).await?;
-            manager.remove_group_member(&master_key, uuid.into()).await?;
-            println!("Member removed successfully!");
+            for member_uuid in &uuid {
+                manager.remove_group_member(&master_key, (*member_uuid).into()).await?;
+                println!("Member {} removed successfully!", member_uuid);
+            }
         }
     }
     Ok(())
+}
+
+/// Look up a profile key for a UUID from contacts, profile_keys store, or group memberships.
+async fn find_profile_key<S: Store>(
+    manager: &Manager<S, Registered>,
+    uuid: &Uuid,
+) -> anyhow::Result<ProfileKey> {
+    // Try contacts first
+    if let Some(pk) = manager
+        .store()
+        .contact_by_id(uuid)
+        .await?
+        .and_then(|c| <Vec<u8> as TryInto<[u8; 32]>>::try_into(c.profile_key).ok())
+        .map(ProfileKey::create)
+    {
+        return Ok(pk);
+    }
+
+    // Try profile_keys store
+    let aci: presage::libsignal_service::protocol::Aci = (*uuid).into();
+    let service_id: ServiceId = aci.into();
+    if let Some(pk) = manager.store().profile_key(&service_id).await? {
+        return Ok(pk);
+    }
+
+    // Search group memberships
+    let target_aci: presage::libsignal_service::protocol::Aci = (*uuid).into();
+    for result in manager.store().groups().await? {
+        let (_key, group) = result?;
+        if let Some(member) = group.members.iter().find(|m| m.aci == target_aci) {
+            return Ok(member.profile_key);
+        }
+    }
+
+    Err(anyhow!(
+        "No profile key found for {}. Ensure the user is a contact or group member.",
+        uuid
+    ))
 }
 
 async fn load_registered_and_receive<S: Store + Send>(
