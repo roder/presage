@@ -1633,7 +1633,7 @@ impl<S: Store> Manager<S, Registered> {
         member_aci: Aci,
         member_profile_key: ProfileKey,
     ) -> Result<(), Error<S::Error>> {
-        use libsignal_service::groups_v2::{Role, GroupOperations, GroupCandidate};
+        use libsignal_service::groups_v2::{Role, GroupOperations};
 
         info!(aci = %member_aci.service_id_string(), "adding member to group");
 
@@ -1679,7 +1679,6 @@ impl<S: Store> Manager<S, Registered> {
             }
         } else {
             // No credential - add as pending (invite)
-            let self_aci = self.state.data.service_ids.aci();
             let add_pending_action = group_ops
                 .build_add_member_action(member_aci, member_profile_key, Role::Default)
                 .map_err(|_| Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error))?;
