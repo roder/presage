@@ -250,6 +250,36 @@ enum Cmd {
         #[clap(long, short = 'u', help = "UUID of the member to remove (can be repeated)", action = clap::ArgAction::Append)]
         uuid: Vec<Uuid>,
     },
+    #[clap(about = "Set disappearing messages timer for a group")]
+    SetDisappearingTimer {
+        #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
+        master_key: GroupMasterKeyBytes,
+        #[clap(long, short = 'd', help = "Timer duration in seconds (0 to disable)")]
+        duration: u32,
+    },
+    #[clap(about = "Set a group's description")]
+    SetGroupDescription {
+        #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
+        master_key: GroupMasterKeyBytes,
+        #[clap(long, short = 'd', help = "New description (empty string to clear)")]
+        description: String,
+    },
+    #[clap(about = "Set group access control (who can edit attributes/add members)")]
+    SetGroupAccess {
+        #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
+        master_key: GroupMasterKeyBytes,
+        #[clap(long, help = "Who can edit group attributes: member, administrator", value_parser = parse_access_required)]
+        attributes: Option<String>,
+        #[clap(long, help = "Who can add members: member, administrator", value_parser = parse_access_required)]
+        members: Option<String>,
+    },
+    #[clap(about = "Set group to announcements-only mode (only admins can send)")]
+    SetAnnouncementsOnly {
+        #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
+        master_key: GroupMasterKeyBytes,
+        #[clap(long, help = "Enable announcements-only mode")]
+        enable: bool,
+    },
 }
 
 enum Recipient {
@@ -262,6 +292,24 @@ fn parse_group_master_key(value: &str) -> anyhow::Result<GroupMasterKeyBytes> {
     master_key_bytes
         .try_into()
         .map_err(|_| anyhow::format_err!("master key should be 32 bytes long"))
+}
+
+fn parse_access_required(value: &str) -> anyhow::Result<String> {
+    match value.to_lowercase().as_str() {
+        "member" | "administrator" | "admin" | "any" | "unsatisfiable" => Ok(value.to_lowercase()),
+        _ => Err(anyhow!("Invalid access level: {}. Use: member, administrator, any", value)),
+    }
+}
+
+fn access_required_from_str(value: &str) -> presage::libsignal_service::groups_v2::AccessRequired {
+    use presage::libsignal_service::groups_v2::AccessRequired;
+    match value.to_lowercase().as_str() {
+        "any" => AccessRequired::Any,
+        "member" => AccessRequired::Member,
+        "administrator" | "admin" => AccessRequired::Administrator,
+        "unsatisfiable" => AccessRequired::Unsatisfiable,
+        _ => AccessRequired::Member,
+    }
 }
 
 fn attachments_tmp_dir() -> anyhow::Result<TempDir> {
@@ -1123,6 +1171,37 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 manager.remove_group_member(&master_key, (*member_uuid).into()).await?;
                 println!("Member {} removed successfully!", member_uuid);
             }
+        }
+        Cmd::SetDisappearingTimer { master_key, duration } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            manager.set_disappearing_messages_timer(&master_key, duration).await?;
+            if duration == 0 {
+                println!("Disappearing messages disabled.");
+            } else {
+                println!("Disappearing messages timer set to {} seconds.", duration);
+            }
+        }
+        Cmd::SetGroupDescription { master_key, description } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            manager.set_group_description(&master_key, &description).await?;
+            println!("Group description updated.");
+        }
+        Cmd::SetGroupAccess { master_key, attributes, members } => {
+            if attributes.is_none() && members.is_none() {
+                bail!("At least one of --attributes or --members must be specified");
+            }
+            let mut manager = load_registered_and_receive(store).await?;
+            manager.set_group_access_control(
+                &master_key,
+                attributes.as_deref().map(access_required_from_str),
+                members.as_deref().map(access_required_from_str),
+            ).await?;
+            println!("Group access control updated.");
+        }
+        Cmd::SetAnnouncementsOnly { master_key, enable } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            manager.set_group_announcements_only(&master_key, enable).await?;
+            println!("Group announcements-only mode {}.", if enable { "enabled" } else { "disabled" });
         }
     }
     Ok(())

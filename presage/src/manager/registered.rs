@@ -1851,6 +1851,192 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Sets the disappearing messages timer for a GV2 group.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's 32-byte master key
+    /// * `duration_seconds` - Timer duration in seconds (0 to disable)
+    pub async fn set_disappearing_messages_timer(
+        &mut self,
+        master_key_bytes: &[u8; 32],
+        duration_seconds: u32,
+    ) -> Result<(), Error<S::Error>> {
+        use libsignal_service::groups_v2::{GroupOperations, Timer};
+
+        info!(duration_seconds, "setting disappearing messages timer");
+
+        let group_master_key = GroupMasterKey::new(*master_key_bytes);
+        let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
+
+        let mut groups_manager = self.groups_manager().await?;
+        let current_group = groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await?;
+
+        let group_ops = GroupOperations::new(group_secret_params);
+        let timer = Timer { duration: duration_seconds };
+        let encrypted_timer = group_ops.encrypt_disappearing_message_timer(&timer, &mut rand::rng());
+
+        let actions = libsignal_service::proto::group_change::Actions {
+            revision: current_group.revision + 1,
+            modify_disappearing_messages_timer: Some(
+                libsignal_service::proto::group_change::actions::ModifyDisappearingMessagesTimerAction {
+                    timer: encrypted_timer,
+                },
+            ),
+            ..Default::default()
+        };
+
+        groups_manager
+            .modify_group(&mut rand::rng(), group_secret_params, actions)
+            .await?;
+
+        if let Ok(Some(group)) = upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await {
+            debug!(group_title = %group.title, "disappearing messages timer updated");
+        }
+
+        Ok(())
+    }
+
+    /// Sets the description of a GV2 group.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's 32-byte master key
+    /// * `description` - The new description (empty string to clear)
+    pub async fn set_group_description(
+        &mut self,
+        master_key_bytes: &[u8; 32],
+        description: impl Into<String>,
+    ) -> Result<(), Error<S::Error>> {
+        use libsignal_service::groups_v2::GroupOperations;
+
+        let description = description.into();
+        info!("setting group description");
+
+        let group_master_key = GroupMasterKey::new(*master_key_bytes);
+        let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
+
+        let mut groups_manager = self.groups_manager().await?;
+        let current_group = groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await?;
+
+        let group_ops = GroupOperations::new(group_secret_params);
+        let encrypted_description = group_ops.encrypt_description(&description, &mut rand::rng());
+
+        let actions = libsignal_service::proto::group_change::Actions {
+            revision: current_group.revision + 1,
+            modify_description: Some(
+                libsignal_service::proto::group_change::actions::ModifyDescriptionAction {
+                    description: encrypted_description,
+                },
+            ),
+            ..Default::default()
+        };
+
+        groups_manager
+            .modify_group(&mut rand::rng(), group_secret_params, actions)
+            .await?;
+
+        if let Ok(Some(group)) = upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await {
+            debug!(group_title = %group.title, "group description updated");
+        }
+
+        Ok(())
+    }
+
+    /// Sets access control for a GV2 group.
+    ///
+    /// Controls who can modify group attributes (title, description, avatar)
+    /// and who can add members.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's 32-byte master key
+    /// * `attributes_access` - Who can modify group attributes (None to leave unchanged)
+    /// * `members_access` - Who can add members (None to leave unchanged)
+    pub async fn set_group_access_control(
+        &mut self,
+        master_key_bytes: &[u8; 32],
+        attributes_access: Option<libsignal_service::groups_v2::AccessRequired>,
+        members_access: Option<libsignal_service::groups_v2::AccessRequired>,
+    ) -> Result<(), Error<S::Error>> {
+        info!("setting group access control");
+
+        let group_master_key = GroupMasterKey::new(*master_key_bytes);
+        let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
+
+        let mut groups_manager = self.groups_manager().await?;
+        let current_group = groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await?;
+
+        let actions = libsignal_service::proto::group_change::Actions {
+            revision: current_group.revision + 1,
+            modify_attributes_access: attributes_access.map(|a| {
+                libsignal_service::proto::group_change::actions::ModifyAttributesAccessControlAction {
+                    attributes_access: i32::from(a),
+                }
+            }),
+            modify_member_access: members_access.map(|a| {
+                libsignal_service::proto::group_change::actions::ModifyMembersAccessControlAction {
+                    members_access: i32::from(a),
+                }
+            }),
+            ..Default::default()
+        };
+
+        groups_manager
+            .modify_group(&mut rand::rng(), group_secret_params, actions)
+            .await?;
+
+        if let Ok(Some(group)) = upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await {
+            debug!(group_title = %group.title, "group access control updated");
+        }
+
+        Ok(())
+    }
+
+    /// Sets whether the group is announcements-only (only admins can send messages).
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's 32-byte master key
+    /// * `announcements_only` - true to restrict messages to admins only
+    pub async fn set_group_announcements_only(
+        &mut self,
+        master_key_bytes: &[u8; 32],
+        announcements_only: bool,
+    ) -> Result<(), Error<S::Error>> {
+        info!(announcements_only, "setting group announcements only");
+
+        let group_master_key = GroupMasterKey::new(*master_key_bytes);
+        let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
+
+        let mut groups_manager = self.groups_manager().await?;
+        let current_group = groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await?;
+
+        let actions = libsignal_service::proto::group_change::Actions {
+            revision: current_group.revision + 1,
+            modify_announcements_only: Some(
+                libsignal_service::proto::group_change::actions::ModifyAnnouncementsOnlyAction {
+                    announcements_only,
+                },
+            ),
+            ..Default::default()
+        };
+
+        groups_manager
+            .modify_group(&mut rand::rng(), group_secret_params, actions)
+            .await?;
+
+        if let Ok(Some(group)) = upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await {
+            debug!(group_title = %group.title, "group announcements only updated");
+        }
+
+        Ok(())
+    }
+
     fn credentials(&self) -> ServiceCredentials {
         self.state.credentials()
     }

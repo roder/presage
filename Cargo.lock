@@ -767,7 +767,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ab67060fc6b8ef687992d439ca0fa36e7ed17e9a0b16b25b601e8757df720de"
 dependencies = [
  "data-encoding",
- "syn 2.0.114",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -1924,7 +1924,7 @@ dependencies = [
 [[package]]
 name = "libsignal-service"
 version = "0.1.0"
-source = "git+https://github.com/roder/libsignal-service-rs?branch=main#ff237488267fef0537e5733ead723f9652aa4b34"
+source = "git+https://github.com/roder/libsignal-service-rs?branch=main#4462cf3385d7d12f9896320a1bb2bdf4a6c49f78"
 dependencies = [
  "aes",
  "aes-gcm",
