@@ -1633,12 +1633,13 @@ impl<S: Store> Manager<S, Registered> {
         member_aci: Aci,
         member_profile_key: ProfileKey,
     ) -> Result<(), Error<S::Error>> {
-        use libsignal_service::groups_v2::{Role, GroupOperations};
+        use libsignal_service::groups_v2::{Role, GroupOperations, GroupCandidate};
 
         info!(aci = %member_aci.service_id_string(), "adding member to group");
 
         let group_master_key = GroupMasterKey::new(*master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
+        let server_public_params = self.state.service_configuration().zkgroup_server_public_params;
 
         // Fetch current group to get revision
         let mut groups_manager = self.groups_manager().await?;
@@ -1647,17 +1648,46 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
         let current_revision = current_group.revision;
 
-        // Build add member action
-        let group_ops = GroupOperations::new(group_secret_params);
-        let add_action = group_ops
-            .build_add_member_action(member_aci, member_profile_key, Role::Default)
-            .map_err(|_| Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error))?;
+        // Fetch credential for the new member
+        let credential = match self
+            .get_profile_credential(member_aci, member_profile_key, &server_public_params)
+            .await
+        {
+            Ok(cred) => Some(cred),
+            Err(e) => {
+                warn!(aci = %member_aci.service_id_string(), "Failed to get credential, member will be invited: {}", e);
+                None
+            }
+        };
 
-        // Build actions
-        let actions = libsignal_service::proto::group_change::Actions {
-            revision: current_revision + 1,
-            add_members: vec![add_action],
-            ..Default::default()
+        let group_ops = GroupOperations::new(group_secret_params);
+
+        debug!(
+            current_revision,
+            has_credential = credential.is_some(),
+            "building add member action"
+        );
+
+        let actions = if let Some(cred) = credential {
+            // Build add member action with credential presentation
+            let add_action = group_ops
+                .build_add_member_action_with_credential(&cred, Role::Default, &server_public_params);
+            libsignal_service::proto::group_change::Actions {
+                revision: current_revision + 1,
+                add_members: vec![add_action],
+                ..Default::default()
+            }
+        } else {
+            // No credential - add as pending (invite)
+            let self_aci = self.state.data.service_ids.aci();
+            let add_pending_action = group_ops
+                .build_add_member_action(member_aci, member_profile_key, Role::Default)
+                .map_err(|_| Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error))?;
+            libsignal_service::proto::group_change::Actions {
+                revision: current_revision + 1,
+                add_members: vec![add_pending_action],
+                ..Default::default()
+            }
         };
 
         // Modify the group
