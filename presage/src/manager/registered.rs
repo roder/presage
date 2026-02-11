@@ -1440,7 +1440,11 @@ impl<S: Store> Manager<S, Registered> {
     /// # Example
     /// ```no_run
     /// # use presage::Manager;
+    /// # use libsignal_service::prelude::ServiceId;
+    /// # use libsignal_service::zkgroup::profiles::ProfileKey;
     /// # async fn example<S: presage::store::Store>(mut manager: Manager<S, presage::manager::Registered>) {
+    /// # let member_aci = ServiceId::from([0u8; 17]); // Example ACI
+    /// # let member_profile_key = ProfileKey::from([0u8; 32]); // Example profile key
     /// let members = vec![(member_aci, member_profile_key)];
     /// let master_key = manager.create_group("My Group", members).await.unwrap();
     /// # }
