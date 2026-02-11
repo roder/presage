@@ -1427,6 +1427,309 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Creates a new GV2 group with the specified title and members.
+    ///
+    /// # Arguments
+    /// * `title` - The group's display name
+    /// * `members` - Vector of (Aci, ProfileKey) tuples for initial members
+    ///
+    /// # Returns
+    /// * `Ok([u8; 32])` - The group's master key bytes (store this!)
+    /// * `Err(Error)` if group creation fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use presage::Manager;
+    /// # async fn example<S: presage::store::Store>(mut manager: Manager<S, presage::manager::Registered>) {
+    /// let members = vec![(member_aci, member_profile_key)];
+    /// let master_key = manager.create_group("My Group", members).await.unwrap();
+    /// # }
+    /// ```
+    pub async fn create_group(
+        &mut self,
+        title: impl Into<String>,
+        members: Vec<(Aci, ProfileKey)>,
+    ) -> Result<[u8; 32], Error<S::Error>> {
+        use libsignal_service::groups_v2::{AccessControl, AccessRequired, Member as GroupMember, Role};
+
+        let title = title.into();
+        info!(%title, member_count = members.len(), "creating new group");
+
+        // Generate new group master key
+        let master_key_bytes: [u8; 32] = rand::random();
+        let group_master_key = GroupMasterKey::new(master_key_bytes);
+        let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
+
+        // Build member list (other members as DEFAULT role)
+        let group_members: Vec<GroupMember> = members
+            .into_iter()
+            .map(|(aci, profile_key)| GroupMember {
+                aci,
+                role: Role::Default,
+                profile_key,
+                joined_at_revision: 0,
+            })
+            .chain(std::iter::once(GroupMember {
+                aci: self.state.data.service_ids.aci(),
+                role: Role::Administrator,
+                profile_key: self.state.data.profile_key(),
+                joined_at_revision: 0,
+            }))
+            .collect();
+
+        // Build group model
+        let group = libsignal_service::groups_v2::Group {
+            title: title.clone(),
+            avatar: String::new(),
+            disappearing_messages_timer: None,
+            access_control: Some(AccessControl {
+                attributes: AccessRequired::Member,
+                members: AccessRequired::Member,
+                add_from_invite_link: AccessRequired::Unsatisfiable,
+            }),
+            revision: 0,
+            members: group_members,
+            pending_members: vec![],
+            requesting_members: vec![],
+            invite_link_password: vec![],
+            description: None,
+            announcements_only: false,
+            banned_members: vec![],
+        };
+
+        // Create the group on the server
+        let mut groups_manager = self.groups_manager().await?;
+        let created_group = groups_manager
+            .create_group(&mut rand::rng(), group_secret_params, group)
+            .await?;
+
+        // Save the created group to local store
+        let presage_group: crate::model::groups::Group = created_group.into();
+        self.store
+            .save_group(master_key_bytes.try_into().unwrap(), presage_group)
+            .await?;
+
+        info!(group_title = %title, "group created successfully");
+
+        Ok(master_key_bytes)
+    }
+
+    /// Adds a member to an existing GV2 group.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's 32-byte master key
+    /// * `member_aci` - The ACI of the member to add
+    /// * `member_profile_key` - The profile key of the member to add
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(Error)` if the add operation fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use presage::Manager;
+    /// # async fn example<S: presage::store::Store>(mut manager: Manager<S, presage::manager::Registered>) {
+    /// # let master_key_bytes = [0u8; 32];
+    /// # let member_aci = todo!();
+    /// # let member_profile_key = todo!();
+    /// manager.add_group_member(&master_key_bytes, member_aci, member_profile_key).await.unwrap();
+    /// # }
+    /// ```
+    pub async fn add_group_member(
+        &mut self,
+        master_key_bytes: &[u8; 32],
+        member_aci: Aci,
+        member_profile_key: ProfileKey,
+    ) -> Result<(), Error<S::Error>> {
+        use libsignal_service::groups_v2::{Role, GroupOperations};
+
+        info!(aci = %member_aci.service_id_string(), "adding member to group");
+
+        let group_master_key = GroupMasterKey::new(*master_key_bytes);
+        let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
+
+        // Fetch current group to get revision
+        let mut groups_manager = self.groups_manager().await?;
+        let current_group = groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await?;
+        let current_revision = current_group.revision;
+
+        // Build add member action
+        let group_ops = GroupOperations::new(group_secret_params);
+        let add_action = group_ops
+            .build_add_member_action(member_aci, member_profile_key, Role::Default)
+            .map_err(|_| Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error))?;
+
+        // Build actions
+        let actions = libsignal_service::proto::group_change::Actions {
+            revision: current_revision + 1,
+            add_members: vec![add_action],
+            ..Default::default()
+        };
+
+        // Modify the group
+        groups_manager
+            .modify_group(&mut rand::rng(), group_secret_params, actions)
+            .await?;
+
+        // Refresh local group state
+        if let Ok(Some(group)) = upsert_group(
+            &self.store,
+            &mut groups_manager,
+            master_key_bytes,
+            &0,
+        )
+        .await
+        {
+            debug!(group_title = %group.title, member_count = group.members.len(), "group updated after adding member");
+        }
+
+        Ok(())
+    }
+
+    /// Removes a member from an existing GV2 group.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's 32-byte master key
+    /// * `member_aci` - The ACI of the member to remove
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(Error)` if the remove operation fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use presage::Manager;
+    /// # async fn example<S: presage::store::Store>(mut manager: Manager<S, presage::manager::Registered>) {
+    /// # let master_key_bytes = [0u8; 32];
+    /// # let member_aci = todo!();
+    /// manager.remove_group_member(&master_key_bytes, member_aci).await.unwrap();
+    /// # }
+    /// ```
+    pub async fn remove_group_member(
+        &mut self,
+        master_key_bytes: &[u8; 32],
+        member_aci: Aci,
+    ) -> Result<(), Error<S::Error>> {
+        use libsignal_service::groups_v2::GroupOperations;
+
+        info!(aci = %member_aci.service_id_string(), "removing member from group");
+
+        let group_master_key = GroupMasterKey::new(*master_key_bytes);
+        let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
+
+        // Fetch current group to get revision
+        let mut groups_manager = self.groups_manager().await?;
+        let current_group = groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await?;
+        let current_revision = current_group.revision;
+
+        // Build remove member action
+        let group_ops = GroupOperations::new(group_secret_params);
+        let remove_action = group_ops
+            .build_remove_member_action(member_aci)
+            .map_err(|_| Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error))?;
+
+        // Build actions
+        let actions = libsignal_service::proto::group_change::Actions {
+            revision: current_revision + 1,
+            delete_members: vec![remove_action],
+            ..Default::default()
+        };
+
+        // Modify the group
+        groups_manager
+            .modify_group(&mut rand::rng(), group_secret_params, actions)
+            .await?;
+
+        // Refresh local group state
+        if let Ok(Some(group)) = upsert_group(
+            &self.store,
+            &mut groups_manager,
+            master_key_bytes,
+            &0,
+        )
+        .await
+        {
+            debug!(group_title = %group.title, member_count = group.members.len(), "group updated after removing member");
+        }
+
+        Ok(())
+    }
+
+    /// Updates the title of an existing GV2 group.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's 32-byte master key
+    /// * `new_title` - The new title for the group
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(Error)` if the update operation fails
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use presage::Manager;
+    /// # async fn example<S: presage::store::Store>(mut manager: Manager<S, presage::manager::Registered>) {
+    /// # let master_key_bytes = [0u8; 32];
+    /// manager.update_group_title(&master_key_bytes, "New Group Name").await.unwrap();
+    /// # }
+    /// ```
+    pub async fn update_group_title(
+        &mut self,
+        master_key_bytes: &[u8; 32],
+        new_title: impl Into<String>,
+    ) -> Result<(), Error<S::Error>> {
+        use libsignal_service::groups_v2::GroupOperations;
+
+        let new_title = new_title.into();
+        info!(%new_title, "updating group title");
+
+        let group_master_key = GroupMasterKey::new(*master_key_bytes);
+        let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
+
+        // Fetch current group to get revision
+        let mut groups_manager = self.groups_manager().await?;
+        let current_group = groups_manager
+            .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
+            .await?;
+        let current_revision = current_group.revision;
+
+        // Build modify title action
+        let group_ops = GroupOperations::new(group_secret_params);
+        let encrypted_title = group_ops.encrypt_title(&new_title, &mut rand::rng());
+
+        // Build actions
+        let actions = libsignal_service::proto::group_change::Actions {
+            revision: current_revision + 1,
+            modify_title: Some(libsignal_service::proto::group_change::actions::ModifyTitleAction {
+                title: encrypted_title,
+            }),
+            ..Default::default()
+        };
+
+        // Modify the group
+        groups_manager
+            .modify_group(&mut rand::rng(), group_secret_params, actions)
+            .await?;
+
+        // Refresh local group state
+        if let Ok(Some(group)) = upsert_group(
+            &self.store,
+            &mut groups_manager,
+            master_key_bytes,
+            &0,
+        )
+        .await
+        {
+            debug!(group_title = %group.title, "group title updated");
+        }
+
+        Ok(())
+    }
+
     fn credentials(&self) -> ServiceCredentials {
         self.state.credentials()
     }
