@@ -229,6 +229,27 @@ enum Cmd {
         #[clap(long, help = "Poll message timestamp to terminate")]
         poll_timestamp: u64,
     },
+    #[clap(about = "Create a new group")]
+    CreateGroup {
+        #[clap(long, help = "Title of the group")]
+        title: String,
+        #[clap(long, help = "Member UUIDs to add (can be repeated)", action = clap::ArgAction::Append)]
+        member: Vec<Uuid>,
+    },
+    #[clap(about = "Add a member to an existing group")]
+    AddMember {
+        #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
+        master_key: GroupMasterKeyBytes,
+        #[clap(long, help = "UUID of the member to add")]
+        uuid: Uuid,
+    },
+    #[clap(about = "Remove a member from an existing group")]
+    RemoveMember {
+        #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
+        master_key: GroupMasterKeyBytes,
+        #[clap(long, help = "UUID of the member to remove")]
+        uuid: Uuid,
+    },
 }
 
 enum Recipient {
@@ -1073,6 +1094,56 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             let mut manager = load_registered_and_receive(store).await?;
             manager.terminate_poll(&master_key, poll_timestamp).await?;
             println!("Poll terminated successfully");
+        }
+        Cmd::CreateGroup { title, member } => {
+            let mut manager = load_registered_and_receive(store).await?;
+
+            // Fetch profile keys for all members from contacts
+            let mut members_with_keys = Vec::new();
+            for uuid in member {
+                let contact = manager
+                    .store()
+                    .contact_by_id(&uuid)
+                    .await?
+                    .ok_or_else(|| anyhow!("Contact not found for UUID: {}", uuid))?;
+
+                let profile_key_bytes: [u8; 32] = contact
+                    .profile_key
+                    .try_into()
+                    .map_err(|_| anyhow!("Profile key is not 32 bytes or empty for uuid: {}", uuid))?;
+
+                let profile_key = ProfileKey::create(profile_key_bytes);
+                members_with_keys.push((uuid.into(), profile_key));
+            }
+
+            let master_key = manager.create_group(title, members_with_keys).await?;
+            println!("Group created successfully!");
+            println!("Master key (save this!): {}", hex::encode(master_key));
+        }
+        Cmd::AddMember { master_key, uuid } => {
+            let mut manager = load_registered_and_receive(store).await?;
+
+            // Fetch profile key for member from contacts
+            let contact = manager
+                .store()
+                .contact_by_id(&uuid)
+                .await?
+                .ok_or_else(|| anyhow!("Contact not found for UUID: {}", uuid))?;
+
+            let profile_key_bytes: [u8; 32] = contact
+                .profile_key
+                .try_into()
+                .map_err(|_| anyhow!("Profile key is not 32 bytes or empty for uuid: {}", uuid))?;
+
+            let profile_key = ProfileKey::create(profile_key_bytes);
+
+            manager.add_group_member(&master_key, uuid.into(), profile_key).await?;
+            println!("Member added successfully!");
+        }
+        Cmd::RemoveMember { master_key, uuid } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            manager.remove_group_member(&master_key, uuid.into()).await?;
+            println!("Member removed successfully!");
         }
     }
     Ok(())
