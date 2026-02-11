@@ -33,6 +33,7 @@ use libsignal_service::{
     utils::serde_signaling_key,
     websocket,
     websocket::SignalWebSocket,
+    zkgroup,
     zkgroup::{
         groups::{GroupMasterKey, GroupSecretParams},
         profiles::ProfileKey,
@@ -1456,7 +1457,7 @@ impl<S: Store> Manager<S, Registered> {
         title: impl Into<String>,
         members: Vec<(Aci, ProfileKey)>,
     ) -> Result<[u8; 32], Error<S::Error>> {
-        use libsignal_service::groups_v2::{AccessControl, AccessRequired, Member as GroupMember, Role};
+        use libsignal_service::groups_v2::{AccessControl, AccessRequired, GroupCandidate};
 
         let title = title.into();
         info!(%title, member_count = members.len(), "creating new group");
@@ -1466,47 +1467,51 @@ impl<S: Store> Manager<S, Registered> {
         let group_master_key = GroupMasterKey::new(master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
 
-        // Build member list (other members as DEFAULT role)
-        let group_members: Vec<GroupMember> = members
-            .into_iter()
-            .map(|(aci, profile_key)| GroupMember {
-                aci,
-                role: Role::Default,
-                profile_key,
-                joined_at_revision: 0,
-            })
-            .chain(std::iter::once(GroupMember {
-                aci: self.state.data.service_ids.aci(),
-                role: Role::Administrator,
-                profile_key: self.state.data.profile_key(),
-                joined_at_revision: 0,
-            }))
-            .collect();
+        let server_public_params = self.state.service_configuration().zkgroup_server_public_params;
 
-        // Build group model
-        let group = libsignal_service::groups_v2::Group {
-            title: title.clone(),
-            avatar: String::new(),
-            disappearing_messages_timer: None,
-            access_control: Some(AccessControl {
-                attributes: AccessRequired::Member,
-                members: AccessRequired::Member,
-                add_from_invite_link: AccessRequired::Unsatisfiable,
-            }),
-            revision: 0,
-            members: group_members,
-            pending_members: vec![],
-            requesting_members: vec![],
-            invite_link_password: vec![],
-            description: None,
-            announcements_only: false,
-            banned_members: vec![],
-        };
+        // Fetch credential for self
+        let self_aci = self.state.data.service_ids.aci();
+        let self_profile_key = self.state.data.profile_key();
+        let self_credential = self
+            .get_profile_credential(self_aci, self_profile_key, &server_public_params)
+            .await?;
 
-        // Create the group on the server
+        // Build member candidates with credentials
+        let mut candidates = Vec::with_capacity(members.len());
+        for (aci, profile_key) in members {
+            let credential = match self
+                .get_profile_credential(aci, profile_key, &server_public_params)
+                .await
+            {
+                Ok(cred) => Some(cred),
+                Err(e) => {
+                    warn!(aci = %aci.service_id_string(), "Failed to get credential, member will be invited: {}", e);
+                    None
+                }
+            };
+            candidates.push(GroupCandidate {
+                service_id: aci.into(),
+                credential,
+            });
+        }
+
+        // Create the group on the server using credentials
         let mut groups_manager = self.groups_manager().await?;
         let created_group = groups_manager
-            .create_group(&mut rand::rng(), group_secret_params, group)
+            .create_group_with_credentials(
+                &mut rand::rng(),
+                group_secret_params,
+                &title,
+                None, // description
+                None, // disappearing_messages_timer
+                Some(&AccessControl {
+                    attributes: AccessRequired::Member,
+                    members: AccessRequired::Member,
+                    add_from_invite_link: AccessRequired::Unsatisfiable,
+                }),
+                &self_credential,
+                &candidates,
+            )
             .await?;
 
         // Save the created group to local store
@@ -1515,9 +1520,90 @@ impl<S: Store> Manager<S, Registered> {
             .save_group(master_key_bytes.try_into().unwrap(), presage_group)
             .await?;
 
+        // Notify all members about the new group (GV2 protocol Step 10).
+        // Send a DataMessage with GroupContextV2 { masterKey, revision: 0 }
+        // to all members (including pending) except self.
+        let group_update = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key_bytes.to_vec()),
+                revision: Some(0),
+                group_change: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+
+        self.send_message_to_group(&master_key_bytes, group_update, timestamp)
+            .await?;
+
         info!(group_title = %title, "group created successfully");
 
         Ok(master_key_bytes)
+    }
+
+    /// Fetch or retrieve cached profile credential for a user.
+    ///
+    /// This method first checks the local store for a cached credential. If not found
+    /// or expired, it fetches a new credential from the Signal server.
+    async fn get_profile_credential(
+        &mut self,
+        aci: Aci,
+        profile_key: ProfileKey,
+        server_public_params: &libsignal_service::zkgroup::ServerPublicParams,
+    ) -> Result<libsignal_service::zkgroup::profiles::ExpiringProfileKeyCredential, Error<S::Error>>
+    {
+        use libsignal_service::groups_v2::credentials::{
+            create_credential_request, receive_credential,
+        };
+        use libsignal_service::zkgroup::profiles::ExpiringProfileKeyCredentialResponse;
+
+        let uuid: Uuid = aci.into();
+
+        // Check cache first
+        if let Some(credential_bytes) = self.store.profile_credential(&uuid).await? {
+            let credential: libsignal_service::zkgroup::profiles::ExpiringProfileKeyCredential =
+                zkgroup::deserialize(&credential_bytes)
+                    .map_err(|_| Error::CredentialDeserializationError)?;
+            debug!(%uuid, "using cached profile credential");
+            return Ok(credential);
+        }
+
+        debug!(%uuid, "fetching profile credential from server");
+
+        // Need to fetch from server
+        let (context, request) =
+            create_credential_request(server_public_params, aci, &profile_key);
+
+        let mut identified_ws = self.identified_websocket(false).await?;
+        let response = identified_ws
+            .retrieve_profile_with_credential(aci, profile_key, &request)
+            .await?;
+
+        let credential_response_bytes = response
+            .credential
+            .ok_or(Error::CredentialNotReturned)?;
+        let credential_response: ExpiringProfileKeyCredentialResponse =
+            zkgroup::deserialize(&credential_response_bytes)
+                .map_err(|_| Error::CredentialDeserializationError)?;
+
+        let credential = receive_credential(server_public_params, &context, &credential_response)
+            .map_err(|_| Error::ZkGroupVerificationFailure)?;
+
+        // Cache the credential
+        let credential_bytes = zkgroup::serialize(&credential);
+        let expiration_time = credential.get_expiration_time().epoch_seconds();
+        self.store
+            .save_profile_credential(uuid, credential_bytes, expiration_time)
+            .await?;
+
+        debug!(%uuid, "cached new profile credential");
+
+        Ok(credential)
     }
 
     /// Adds a member to an existing GV2 group.

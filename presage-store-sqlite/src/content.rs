@@ -624,6 +624,60 @@ impl ContentsStore for SqliteStore {
             .map_err(From::from)
     }
 
+    async fn save_profile_credential(
+        &mut self,
+        uuid: Uuid,
+        credential_bytes: Vec<u8>,
+        expiration_time: u64,
+    ) -> Result<(), Self::ContentsStoreError> {
+        let expiration_time = expiration_time as i64;
+        sqlx::query(
+            "INSERT OR REPLACE INTO profile_credentials (uuid, credential, expiration_time) 
+             VALUES (?, ?, ?)",
+        )
+        .bind(uuid.to_string())
+        .bind(&credential_bytes)
+        .bind(expiration_time)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn profile_credential(
+        &self,
+        uuid: &Uuid,
+    ) -> Result<Option<Vec<u8>>, Self::ContentsStoreError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before UNIX epoch")
+            .as_secs() as i64;
+
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT credential FROM profile_credentials 
+             WHERE uuid = ? AND expiration_time > ?",
+        )
+        .bind(uuid.to_string())
+        .bind(now)
+        .fetch_optional(&self.db)
+        .await?;
+
+        Ok(row.map(|(bytes,)| bytes))
+    }
+
+    async fn clear_expired_credentials(&mut self) -> Result<u64, Self::ContentsStoreError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before UNIX epoch")
+            .as_secs() as i64;
+
+        let result = sqlx::query("DELETE FROM profile_credentials WHERE expiration_time <= ?")
+            .bind(now)
+            .execute(&self.db)
+            .await?;
+
+        Ok(result.rows_affected())
+    }
+
     async fn add_sticker_pack(
         &mut self,
         pack: &StickerPack,

@@ -303,6 +303,35 @@ pub trait ContentsStore: Send + Sync {
         key: ProfileKey,
     ) -> impl Future<Output = Result<Option<AvatarBytes>, Self::ContentsStoreError>>;
 
+    // Profile Credentials (for GV2 group operations)
+
+    /// Save an expiring profile key credential for a user.
+    ///
+    /// The credential bytes should be the zkgroup-serialized `ExpiringProfileKeyCredential`.
+    /// These credentials are used to create presentations when creating/modifying groups.
+    fn save_profile_credential(
+        &mut self,
+        uuid: Uuid,
+        credential_bytes: Vec<u8>,
+        expiration_time: u64,
+    ) -> impl Future<Output = Result<(), Self::ContentsStoreError>> + Send;
+
+    /// Get a cached profile credential for a user, if it exists and hasn't expired.
+    ///
+    /// Returns None if no credential is cached or if it has expired.
+    /// The returned bytes are the zkgroup-serialized `ExpiringProfileKeyCredential`.
+    fn profile_credential(
+        &self,
+        uuid: &Uuid,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>, Self::ContentsStoreError>> + Send;
+
+    /// Delete expired profile credentials (housekeeping).
+    ///
+    /// Returns the number of credentials deleted.
+    fn clear_expired_credentials(
+        &mut self,
+    ) -> impl Future<Output = Result<u64, Self::ContentsStoreError>> + Send;
+
     // Stickers
 
     /// Add a sticker pack

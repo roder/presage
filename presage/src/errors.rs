@@ -78,6 +78,12 @@ pub enum Error<S: std::error::Error> {
     UpdatePreKeyFailure,
     #[error("invalid device ID (out of bounds)")]
     InvalidDeviceId,
+    #[error("credential not returned from server: your profile may not be uploaded. Use Signal Desktop/Mobile to set a profile name first.")]
+    CredentialNotReturned,
+    #[error("zkgroup verification failure")]
+    ZkGroupVerificationFailure,
+    #[error("credential deserialization error")]
+    CredentialDeserializationError,
 }
 
 impl<S: std::error::Error> From<MessageSenderError> for Error<S> {
