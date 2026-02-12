@@ -1,7 +1,6 @@
 use std::convert::TryInto;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
 use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, bail, Context as _};
@@ -392,6 +391,10 @@ async fn send<S: Store>(
         }
     }
 
+    // Drop the message stream so its websocket is released.
+    // This allows send_message/send_message_to_group to create a fresh websocket.
+    drop(messages);
+
     println!("done synchronizing, sending your message now!");
 
     match recipient {
@@ -410,16 +413,6 @@ async fn send<S: Store>(
                 .expect("failed to send message");
         }
     }
-
-    tokio::time::timeout(Duration::from_secs(60), async move {
-        while let Some(msg) = messages.next().await {
-            if let Received::Contacts = msg {
-                println!("got contacts sync!");
-                break;
-            }
-        }
-    })
-    .await?;
 
     Ok(())
 }
