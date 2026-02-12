@@ -7,7 +7,8 @@ edition = "2021"
 license = "AGPL-3.0-only"
 
 [dependencies]
-libsignal-service = { git = "https://github.com/roder/libsignal-service-rs", branch = "main" }
+# Using local path during development for new APIs (unregister_account)
+libsignal-service = { path = "../../libsignal-service-rs" }
 
 base64 = "0.22"
 futures = "0.3"

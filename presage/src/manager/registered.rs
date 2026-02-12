@@ -2176,6 +2176,26 @@ impl<S: Store> Manager<S, Registered> {
 
         Ok(account_manager.linked_devices(&aci_protocol_store).await?)
     }
+
+    /// Delete the account from Signal servers and clear local store.
+    ///
+    /// This permanently deletes the account from Signal servers, removing all groups,
+    /// contacts, and messages. The phone number can be re-registered afterwards with
+    /// a fresh account (existing contacts will see "safety number changed").
+    ///
+    /// After calling this method, the Manager is no longer usable.
+    ///
+    /// CAUTION: This is irreversible. All account data will be lost.
+    pub async fn delete_account(mut self) -> Result<(), Error<S::Error>> {
+        // Send delete request to Signal server
+        self.identified_websocket(false)
+            .await?
+            .unregister_account()
+            .await?;
+        // Clear local store
+        self.store.clear().await?;
+        Ok(())
+    }
 }
 
 /// Set the timestamp in any DataMessage so it matches its envelope's
