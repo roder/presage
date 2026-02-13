@@ -249,6 +249,11 @@ enum Cmd {
         #[clap(long, short = 'u', help = "UUID of the member to remove (can be repeated)", action = clap::ArgAction::Append)]
         uuid: Vec<Uuid>,
     },
+    #[clap(about = "Resolve a Signal username to an ACI")]
+    ResolveUsername {
+        #[clap(help = "Signal username (e.g., matt.42)")]
+        username: String,
+    },
     #[clap(about = "Set disappearing messages timer for a group")]
     SetDisappearingTimer {
         #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
@@ -1216,6 +1221,18 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                     .remove_group_member(&master_key, (*member_uuid).into())
                     .await?;
                 println!("Member {} removed successfully!", member_uuid);
+            }
+        }
+        Cmd::ResolveUsername { username } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            match manager.resolve_username(&username).await? {
+                Some(aci) => {
+                    println!("Username '{}' resolved to ACI:", username);
+                    println!("  {}", aci.service_id_string());
+                }
+                None => {
+                    println!("Username '{}' not found", username);
+                }
             }
         }
         Cmd::SetDisappearingTimer {
