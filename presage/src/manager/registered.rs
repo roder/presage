@@ -1022,6 +1022,100 @@ impl<S: Store> Manager<S, Registered> {
         Ok(ws.lookup_username(username).await?)
     }
 
+    /// Resolve a phone number (E.164 format, e.g., "+15551234567") to an ACI.
+    ///
+    /// Uses Contact Discovery Service (CDSI) via libsignal-net. The phone number
+    /// is looked up inside an SGX enclave for privacy.
+    pub async fn resolve_phone_number(
+        &mut self,
+        e164: &str,
+    ) -> Result<Option<Aci>, Error<S::Error>> {
+        use libsignal_core::E164;
+        use libsignal_net::auth::Auth;
+        use libsignal_net::cdsi::{CdsiConnection, LookupRequest};
+        use libsignal_net::connect_state::{ConnectState, ConnectionResources, SUGGESTED_CONNECT_CONFIG};
+        use libsignal_net::env::PROD as PROD_ENV;
+        use libsignal_net_infra::dns::DnsResolver;
+        use libsignal_net_infra::utils::no_network_change_events;
+
+        // Parse phone number
+        let phone: E164 = e164.parse().map_err(|_| {
+            Error::ServiceError(ServiceError::SendError {
+                reason: format!("Invalid E.164 phone number: {}", e164),
+            })
+        })?;
+
+        // 1. Get CDSI auth credentials from chat server
+        let mut ws = self.identified_websocket(false).await?;
+        let cdsi_auth_response = ws.get_cdsi_auth().await?;
+
+        let auth = Auth {
+            username: cdsi_auth_response.username,
+            password: cdsi_auth_response.password,
+        };
+
+        // 2. Set up connection infrastructure
+        let connect_state = ConnectState::new(SUGGESTED_CONNECT_CONFIG);
+        let network_change_event = no_network_change_events();
+        let static_map = std::collections::HashMap::from([
+            PROD_ENV.cdsi.domain_config.static_fallback(
+                libsignal_net::env::StaticIpOrder::HARDCODED,
+            ),
+        ]);
+        let dns_resolver = DnsResolver::new_with_static_fallback(
+            static_map,
+            &network_change_event,
+        );
+
+        let connection_resources = ConnectionResources {
+            connect_state: &connect_state,
+            dns_resolver: &dns_resolver,
+            network_change_event: &network_change_event,
+            confirmation_header_name: None,
+        };
+
+        // 3. Connect to CDSI using DirectOrProxyProvider::direct() wrapper
+        let cdsi_endpoint = &PROD_ENV.cdsi;
+        let cdsi_connection = CdsiConnection::connect_with(
+            connection_resources,
+            libsignal_net_infra::route::DirectOrProxyProvider::direct(
+                cdsi_endpoint.enclave_websocket_provider(
+                    libsignal_net_infra::EnableDomainFronting::No,
+                ),
+            ),
+            cdsi_endpoint.ws_config,
+            &cdsi_endpoint.params,
+            &auth,
+        )
+        .await
+        .map_err(|e| {
+            Error::ServiceError(ServiceError::SendError {
+                reason: format!("CDSI connection failed: {:?}", e),
+            })
+        })?;
+
+        // 4. Send lookup request
+        let request = LookupRequest {
+            new_e164s: vec![phone],
+            ..Default::default()
+        };
+
+        let (_token, collector) = cdsi_connection.send_request(request).await.map_err(|e| {
+            Error::ServiceError(ServiceError::SendError {
+                reason: format!("CDSI request failed: {:?}", e),
+            })
+        })?;
+
+        // 5. Collect response
+        let response = collector.collect().await.map_err(|e| {
+            Error::ServiceError(ServiceError::SendError {
+                reason: format!("CDSI response failed: {:?}", e),
+            })
+        })?;
+
+        Ok(response.records.first().and_then(|r| r.aci))
+    }
+
     /// Uploads one attachment prior to linking them in a message.
     pub async fn upload_attachment(
         &self,
