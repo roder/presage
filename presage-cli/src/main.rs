@@ -254,6 +254,11 @@ enum Cmd {
         #[clap(help = "Signal username (e.g., matt.42)")]
         username: String,
     },
+    #[clap(about = "Resolve a phone number to an ACI")]
+    ResolvePhoneNumber {
+        #[clap(help = "Phone number in E.164 format (e.g., +15551234567)")]
+        phone_number: String,
+    },
     #[clap(about = "Set disappearing messages timer for a group")]
     SetDisappearingTimer {
         #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
@@ -1231,6 +1236,18 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 }
                 None => {
                     println!("Username '{}' not found", username);
+                }
+            }
+        }
+        Cmd::ResolvePhoneNumber { phone_number } => {
+            let mut manager = load_registered_and_receive(store).await?;
+            match manager.resolve_phone_number(&phone_number).await? {
+                Some(aci) => {
+                    println!("Phone number '{}' resolved to ACI:", phone_number);
+                    println!("  {}", aci.service_id_string());
+                }
+                None => {
+                    println!("Phone number '{}' not found", phone_number);
                 }
             }
         }
