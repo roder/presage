@@ -1054,14 +1054,17 @@ impl<S: Store> Manager<S, Registered> {
         })
     }
 
-    /// Resolve a phone number (E.164 format, e.g., "+15551234567") to an ACI.
+    /// Resolve a phone number (E.164 format, e.g., "+15551234567") to a ServiceId.
     ///
     /// Uses Contact Discovery Service (CDSI) via libsignal-net. The phone number
     /// is looked up inside an SGX enclave for privacy.
+    ///
+    /// Returns ACI if available, otherwise PNI. Some accounts have privacy settings
+    /// that prevent ACI disclosure through CDSI, in which case only PNI is available.
     pub async fn resolve_phone_number(
         &mut self,
         e164: &str,
-    ) -> Result<Option<Aci>, Error<S::Error>> {
+    ) -> Result<Option<ServiceId>, Error<S::Error>> {
         use libsignal_core::E164;
         use libsignal_net::auth::Auth;
         use libsignal_net::cdsi::{CdsiConnection, LookupRequest};
@@ -1145,7 +1148,29 @@ impl<S: Store> Manager<S, Registered> {
             })
         })?;
 
-        Ok(response.records.first().and_then(|r| r.aci))
+        tracing::debug!(
+            "CDSI lookup response: {} records, debug_permits_used: {}",
+            response.records.len(),
+            response.debug_permits_used
+        );
+        
+        for (i, record) in response.records.iter().enumerate() {
+            tracing::debug!(
+                "CDSI record {}: e164={:?}, aci={:?}, pni={:?}",
+                i,
+                record.e164,
+                record.aci.as_ref().map(|a| a.service_id_string()),
+                record.pni.as_ref().map(|p| p.service_id_string())
+            );
+        }
+
+        // Return ACI if available, otherwise PNI.
+        // Some accounts have privacy settings that prevent ACI disclosure through CDSI.
+        Ok(response.records.first().and_then(|r| {
+            r.aci
+                .map(ServiceId::from)
+                .or_else(|| r.pni.map(ServiceId::from))
+        }))
     }
 
     /// Uploads one attachment prior to linking them in a message.

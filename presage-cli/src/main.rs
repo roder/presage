@@ -1242,9 +1242,13 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
         Cmd::ResolvePhoneNumber { phone_number } => {
             let mut manager = load_registered_and_receive(store).await?;
             match manager.resolve_phone_number(&phone_number).await? {
-                Some(aci) => {
-                    println!("Phone number '{}' resolved to ACI:", phone_number);
-                    println!("  {}", aci.service_id_string());
+                Some(service_id) => {
+                    let id_type = match service_id.kind() {
+                        presage::libsignal_service::protocol::ServiceIdKind::Aci => "ACI",
+                        presage::libsignal_service::protocol::ServiceIdKind::Pni => "PNI",
+                    };
+                    println!("Phone number '{}' resolved to {}:", phone_number, id_type);
+                    println!("  {}", service_id.service_id_string());
                 }
                 None => {
                     println!("Phone number '{}' not found", phone_number);
