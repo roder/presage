@@ -399,9 +399,8 @@ async fn send<S: Store>(
         }
     }
 
-    // Drop the message stream so its websocket is released.
+    // The message stream reference goes out of scope here, allowing its websocket to be released.
     // This allows send_message/send_message_to_group to create a fresh websocket.
-    drop(messages);
 
     println!("done synchronizing, sending your message now!");
 

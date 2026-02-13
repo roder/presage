@@ -8,9 +8,11 @@ license = "AGPL-3.0-only"
 
 [dependencies]
 libsignal-service = { git = "https://github.com/roder/libsignal-service-rs", branch = "main" }
-libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.87.1" }
+libsignal-net = { git = "https://github.com/signalapp/libsignal", tag = "v0.87.1", features = ["test-util"] }
+libsignal-net-chat = { git = "https://github.com/signalapp/libsignal", tag = "v0.87.1" }
 libsignal-core = { git = "https://github.com/signalapp/libsignal", tag = "v0.87.1" }
 libsignal-net-infra = { git = "https://github.com/signalapp/libsignal", tag = "v0.87.1" }
+usernames = { git = "https://github.com/signalapp/libsignal", tag = "v0.87.1" }
 
 base64 = "0.22"
 futures = "0.3"

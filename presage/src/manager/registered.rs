@@ -1018,8 +1018,40 @@ impl<S: Store> Manager<S, Registered> {
         &mut self,
         username: &str,
     ) -> Result<Option<Aci>, Error<S::Error>> {
-        let mut ws = self.identified_websocket(false).await?;
-        Ok(ws.lookup_username(username).await?)
+        use libsignal_net::chat::test_support::simple_chat_connection;
+        use libsignal_net::env::PROD as PROD_ENV;
+        use libsignal_net_infra::route::DirectOrProxyMode;
+        use libsignal_net_infra::EnableDomainFronting;
+        use libsignal_net_chat::api::Unauth;
+        use libsignal_net_chat::api::usernames::UnauthenticatedChatApi;
+        use usernames::Username;
+
+        let parsed = Username::new(username).map_err(|e| {
+            Error::ServiceError(ServiceError::SendError {
+                reason: format!("Invalid username: {}", e),
+            })
+        })?;
+        let hash = parsed.hash();
+
+        let chat_connection = simple_chat_connection(
+            &PROD_ENV,
+            EnableDomainFronting::No,
+            DirectOrProxyMode::DirectOnly,
+            |_route| true,
+        )
+        .await
+        .map_err(|e| {
+            Error::ServiceError(ServiceError::SendError {
+                reason: format!("Chat connection failed: {:?}", e),
+            })
+        })?;
+
+        let unauth = Unauth(chat_connection);
+        unauth.look_up_username_hash(&hash).await.map_err(|e| {
+            Error::ServiceError(ServiceError::SendError {
+                reason: format!("Username lookup failed: {:?}", e),
+            })
+        })
     }
 
     /// Resolve a phone number (E.164 format, e.g., "+15551234567") to an ACI.
