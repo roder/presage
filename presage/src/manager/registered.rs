@@ -991,6 +991,37 @@ impl<S: Store> Manager<S, Registered> {
         Ok(())
     }
 
+    /// Resolve a Signal username (e.g., "matt.42") to an ACI.
+    ///
+    /// Username hashing and validation is handled by libsignal-service-rs.
+    ///
+    /// # Arguments
+    /// * `username` - Signal username (e.g., "matt.42", case-insensitive)
+    ///
+    /// # Returns
+    /// * `Ok(Some(Aci))` - Username found
+    /// * `Ok(None)` - Username not registered on Signal
+    /// * `Err` - Network or protocol error, or invalid username format
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use presage::Manager;
+    /// # async fn example<S: presage::store::Store>(mut manager: Manager<S, presage::manager::Registered>) {
+    /// match manager.resolve_username("matt.42").await {
+    ///     Ok(Some(aci)) => println!("Found: {}", aci.service_id_string()),
+    ///     Ok(None) => println!("Username not registered"),
+    ///     Err(e) => eprintln!("Error: {}", e),
+    /// }
+    /// # }
+    /// ```
+    pub async fn resolve_username(
+        &mut self,
+        username: &str,
+    ) -> Result<Option<Aci>, Error<S::Error>> {
+        let mut ws = self.identified_websocket(false).await?;
+        Ok(ws.lookup_username(username).await?)
+    }
+
     /// Uploads one attachment prior to linking them in a message.
     pub async fn upload_attachment(
         &self,
