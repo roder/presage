@@ -18,10 +18,10 @@
 #[cfg(test)]
 mod group_crud_integration_tests {
     use presage::{
-        Manager,
-        libsignal_service::prelude::{Uuid, ProfileKey},
+        libsignal_service::prelude::{ProfileKey, Uuid},
         libsignal_service::protocol::Aci,
         model::identity::OnNewIdentity,
+        Manager,
     };
     use presage_store_sqlite::SqliteStore;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,10 +40,7 @@ mod group_crud_integration_tests {
             .ok()
             .and_then(|s| Uuid::parse_str(&s).ok())?;
         let member1_key_hex = std::env::var("TEST_MEMBER_1_PROFILE_KEY").ok()?;
-        let member1_key_bytes: [u8; 32] = hex::decode(&member1_key_hex)
-            .ok()?
-            .try_into()
-            .ok()?;
+        let member1_key_bytes: [u8; 32] = hex::decode(&member1_key_hex).ok()?.try_into().ok()?;
         let member1_profile_key = ProfileKey::create(member1_key_bytes);
 
         let mut members = vec![(member1_uuid, member1_profile_key)];
@@ -51,12 +48,9 @@ mod group_crud_integration_tests {
         // Add second member if provided
         if let (Ok(uuid_str), Ok(key_hex)) = (
             std::env::var("TEST_MEMBER_2_UUID"),
-            std::env::var("TEST_MEMBER_2_PROFILE_KEY")
+            std::env::var("TEST_MEMBER_2_PROFILE_KEY"),
         ) {
-            if let (Ok(uuid), Ok(key_bytes)) = (
-                Uuid::parse_str(&uuid_str),
-                hex::decode(&key_hex)
-            ) {
+            if let (Ok(uuid), Ok(key_bytes)) = (Uuid::parse_str(&uuid_str), hex::decode(&key_hex)) {
                 if let Ok(key_array) = key_bytes.try_into() {
                     members.push((uuid, ProfileKey::create(key_array)));
                 }
@@ -79,18 +73,16 @@ mod group_crud_integration_tests {
         let mut manager = Manager::load_registered(store).await?;
 
         // Create a group with timestamp in title for uniqueness
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let group_title = format!("Test Group {}", timestamp);
 
-        // Convert members to (Aci, ProfileKey) format
-        let members_with_aci: Vec<(Aci, ProfileKey)> = members
+        // Convert members to (Aci, Option<ProfileKey>) format
+        let members_with_aci: Vec<(Aci, Option<ProfileKey>)> = members
             .into_iter()
-            .map(|(uuid, key)| (uuid.into(), key))
+            .map(|(uuid, key)| (uuid.into(), Some(key)))
             .collect();
 
-        let master_key = manager.create_group(&group_title, members_with_aci).await?;
+        let (master_key, _pending) = manager.create_group(&group_title, members_with_aci).await?;
 
         println!("✅ Group created successfully!");
         println!("   Title: {}", group_title);
@@ -128,7 +120,9 @@ mod group_crud_integration_tests {
         let (member_uuid, member_profile_key) = &members[1];
         let member_aci: Aci = (*member_uuid).into();
 
-        manager.add_group_member(&master_key_bytes, member_aci, *member_profile_key).await?;
+        manager
+            .add_group_member(&master_key_bytes, member_aci, Some(*member_profile_key))
+            .await?;
 
         println!("✅ Member added successfully!");
         println!("   Member UUID: {}", member_uuid);
@@ -160,7 +154,9 @@ mod group_crud_integration_tests {
         let (member_uuid, _) = &members[0];
         let member_aci: Aci = (*member_uuid).into();
 
-        manager.remove_group_member(&master_key_bytes, member_aci).await?;
+        manager
+            .remove_group_member(&master_key_bytes, member_aci)
+            .await?;
 
         println!("✅ Member removed successfully!");
         println!("   Member UUID: {}", member_uuid);
@@ -189,16 +185,13 @@ mod group_crud_integration_tests {
         println!("Testing full group CRUD lifecycle...");
 
         // 1. Create a group with the first member
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_secs();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let group_title = format!("CRUD Test Group {}", timestamp);
 
-        let initial_members: Vec<(Aci, ProfileKey)> = vec![
-            (members[0].0.into(), members[0].1)
-        ];
+        let initial_members: Vec<(Aci, Option<ProfileKey>)> =
+            vec![(members[0].0.into(), Some(members[0].1))];
 
-        let master_key = manager.create_group(&group_title, initial_members).await?;
+        let (master_key, _pending) = manager.create_group(&group_title, initial_members).await?;
         println!("✅ Step 1: Group created");
         println!("   Title: {}", group_title);
         println!("   Master key: {}", hex::encode(master_key));
@@ -211,7 +204,9 @@ mod group_crud_integration_tests {
             let (member2_uuid, member2_key) = &members[1];
             let member2_aci: Aci = (*member2_uuid).into();
 
-            manager.add_group_member(&master_key, member2_aci, *member2_key).await?;
+            manager
+                .add_group_member(&master_key, member2_aci, Some(*member2_key))
+                .await?;
             println!("✅ Step 2: Second member added");
             println!("   Member UUID: {}", member2_uuid);
 
@@ -219,7 +214,9 @@ mod group_crud_integration_tests {
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
 
             // 3. Remove the second member
-            manager.remove_group_member(&master_key, member2_aci).await?;
+            manager
+                .remove_group_member(&master_key, member2_aci)
+                .await?;
             println!("✅ Step 3: Second member removed");
             println!("   Member UUID: {}", member2_uuid);
         } else {

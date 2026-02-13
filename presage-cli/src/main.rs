@@ -20,7 +20,7 @@ use presage::libsignal_service::prelude::ProfileKey;
 use presage::libsignal_service::prelude::Uuid;
 use presage::libsignal_service::proto::data_message::Quote;
 use presage::libsignal_service::proto::sync_message::Sent;
-use presage::libsignal_service::protocol::{ServiceId};
+use presage::libsignal_service::protocol::ServiceId;
 use presage::libsignal_service::sender::AttachmentSpec;
 use presage::libsignal_service::zkgroup::GroupMasterKeyBytes;
 use presage::model::contacts::Contact;
@@ -296,7 +296,10 @@ fn parse_group_master_key(value: &str) -> anyhow::Result<GroupMasterKeyBytes> {
 fn parse_access_required(value: &str) -> anyhow::Result<String> {
     match value.to_lowercase().as_str() {
         "member" | "administrator" | "admin" | "any" | "unsatisfiable" => Ok(value.to_lowercase()),
-        _ => Err(anyhow!("Invalid access level: {}. Use: member, administrator, any", value)),
+        _ => Err(anyhow!(
+            "Invalid access level: {}. Use: member, administrator, any",
+            value
+        )),
     }
 }
 
@@ -496,11 +499,14 @@ async fn print_message<S: Store>(
 
         match data_message {
             DataMessage {
-                poll_create: Some(poll), ..
+                poll_create: Some(poll),
+                ..
             } => {
                 let question = poll.question.as_deref().unwrap_or("<no question>");
                 let allow_multiple = poll.allow_multiple.unwrap_or(false);
-                let options = poll.options.iter()
+                let options = poll
+                    .options
+                    .iter()
                     .enumerate()
                     .map(|(i, opt)| format!("  [{}] {}", i, opt))
                     .collect::<Vec<_>>()
@@ -509,20 +515,28 @@ async fn print_message<S: Store>(
                     "📊 Poll: {}\n{}\n({})",
                     question,
                     options,
-                    if allow_multiple { "multiple choice" } else { "single choice" }
+                    if allow_multiple {
+                        "multiple choice"
+                    } else {
+                        "single choice"
+                    }
                 ))
             }
             DataMessage {
-                poll_vote: Some(vote), ..
+                poll_vote: Some(vote),
+                ..
             } => {
-                let selected = vote.option_indexes.iter()
+                let selected = vote
+                    .option_indexes
+                    .iter()
                     .map(|i| format!("option {}", i))
                     .collect::<Vec<_>>()
                     .join(", ");
                 Some(format!("🗳️  Voted on poll: {}", selected))
             }
             DataMessage {
-                poll_terminate: Some(_), ..
+                poll_terminate: Some(_),
+                ..
             } => Some("🔒 Poll terminated".to_string()),
             DataMessage {
                 quote:
@@ -1111,7 +1125,9 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 bail!("Poll cannot have more than 10 options");
             }
 
-            let poll_timestamp = manager.send_poll(&master_key, question, options, allow_multiple).await?;
+            let poll_timestamp = manager
+                .send_poll(&master_key, question, options, allow_multiple)
+                .await?;
             println!("Poll sent successfully (timestamp: {})", poll_timestamp);
         }
         Cmd::VoteOnPoll {
@@ -1125,7 +1141,14 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             }
 
             let mut manager = load_registered_and_receive(store).await?;
-            manager.vote_on_poll(&master_key, poll_author_uuid.into(), poll_timestamp, selected_options).await?;
+            manager
+                .vote_on_poll(
+                    &master_key,
+                    poll_author_uuid.into(),
+                    poll_timestamp,
+                    selected_options,
+                )
+                .await?;
             println!("Vote cast successfully");
         }
         Cmd::TerminatePoll {
@@ -1141,60 +1164,111 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
 
             let mut members_with_keys = Vec::new();
             for member_uuid in &uuid {
-                let profile_key = find_profile_key(&manager, member_uuid).await?;
+                let profile_key = match find_profile_key(&manager, member_uuid).await {
+                    Ok(pk) => Some(pk),
+                    Err(_) => {
+                        println!(
+                            "No profile key for {} — will be added as pending invite",
+                            member_uuid
+                        );
+                        None
+                    }
+                };
                 members_with_keys.push(((*member_uuid).into(), profile_key));
             }
 
-            let master_key = manager.create_group(title, members_with_keys).await?;
+            let (master_key, pending_members) =
+                manager.create_group(title, members_with_keys).await?;
             println!("Group created successfully!");
             println!("Master key (save this!): {}", hex::encode(master_key));
+            if !pending_members.is_empty() {
+                println!(
+                    "Sending invite DMs to {} pending members...",
+                    pending_members.len()
+                );
+                for member_sid in &pending_members {
+                    if let presage::libsignal_service::protocol::ServiceId::Aci(aci) = member_sid {
+                        match manager.send_group_invite_dm(&master_key, *aci).await {
+                            Ok(()) => println!("  Invited: {}", aci.service_id_string()),
+                            Err(e) => {
+                                eprintln!("  Failed to invite {}: {}", aci.service_id_string(), e)
+                            }
+                        }
+                    }
+                }
+            }
         }
         Cmd::AddMember { master_key, uuid } => {
             let mut manager = load_registered_and_receive(store).await?;
 
             for member_uuid in &uuid {
                 let profile_key = find_profile_key(&manager, member_uuid).await?;
-                manager.add_group_member(&master_key, (*member_uuid).into(), profile_key).await?;
+                manager
+                    .add_group_member(&master_key, (*member_uuid).into(), Some(profile_key))
+                    .await?;
                 println!("Member {} added successfully!", member_uuid);
             }
         }
         Cmd::RemoveMember { master_key, uuid } => {
             let mut manager = load_registered_and_receive(store).await?;
             for member_uuid in &uuid {
-                manager.remove_group_member(&master_key, (*member_uuid).into()).await?;
+                manager
+                    .remove_group_member(&master_key, (*member_uuid).into())
+                    .await?;
                 println!("Member {} removed successfully!", member_uuid);
             }
         }
-        Cmd::SetDisappearingTimer { master_key, duration } => {
+        Cmd::SetDisappearingTimer {
+            master_key,
+            duration,
+        } => {
             let mut manager = load_registered_and_receive(store).await?;
-            manager.set_disappearing_messages_timer(&master_key, duration).await?;
+            manager
+                .set_disappearing_messages_timer(&master_key, duration)
+                .await?;
             if duration == 0 {
                 println!("Disappearing messages disabled.");
             } else {
                 println!("Disappearing messages timer set to {} seconds.", duration);
             }
         }
-        Cmd::SetGroupDescription { master_key, description } => {
+        Cmd::SetGroupDescription {
+            master_key,
+            description,
+        } => {
             let mut manager = load_registered_and_receive(store).await?;
-            manager.set_group_description(&master_key, &description).await?;
+            manager
+                .set_group_description(&master_key, &description)
+                .await?;
             println!("Group description updated.");
         }
-        Cmd::SetGroupAccess { master_key, attributes, members } => {
+        Cmd::SetGroupAccess {
+            master_key,
+            attributes,
+            members,
+        } => {
             if attributes.is_none() && members.is_none() {
                 bail!("At least one of --attributes or --members must be specified");
             }
             let mut manager = load_registered_and_receive(store).await?;
-            manager.set_group_access_control(
-                &master_key,
-                attributes.as_deref().map(access_required_from_str),
-                members.as_deref().map(access_required_from_str),
-            ).await?;
+            manager
+                .set_group_access_control(
+                    &master_key,
+                    attributes.as_deref().map(access_required_from_str),
+                    members.as_deref().map(access_required_from_str),
+                )
+                .await?;
             println!("Group access control updated.");
         }
         Cmd::SetAnnouncementsOnly { master_key, enable } => {
             let mut manager = load_registered_and_receive(store).await?;
-            manager.set_group_announcements_only(&master_key, enable).await?;
-            println!("Group announcements-only mode {}.", if enable { "enabled" } else { "disabled" });
+            manager
+                .set_group_announcements_only(&master_key, enable)
+                .await?;
+            println!(
+                "Group announcements-only mode {}.",
+                if enable { "enabled" } else { "disabled" }
+            );
         }
     }
     Ok(())

@@ -1,6 +1,6 @@
 use std::fmt;
 use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::future::select;
 use futures::{future, pin_mut, AsyncReadExt, Stream, StreamExt};
@@ -1448,15 +1448,15 @@ impl<S: Store> Manager<S, Registered> {
     /// # async fn example<S: presage::store::Store>(mut manager: Manager<S, presage::manager::Registered>) {
     /// # let member_aci = Aci::from_uuid_bytes([0u8; 16]); // Example ACI
     /// # let member_profile_key = ProfileKey::create([0u8; 32]); // Example profile key
-    /// let members = vec![(member_aci, member_profile_key)];
-    /// let master_key = manager.create_group("My Group", members).await.unwrap();
+    /// let members = vec![(member_aci, Some(member_profile_key))];
+    /// let (master_key, pending_members) = manager.create_group("My Group", members).await.unwrap();
     /// # }
     /// ```
     pub async fn create_group(
         &mut self,
         title: impl Into<String>,
-        members: Vec<(Aci, ProfileKey)>,
-    ) -> Result<[u8; 32], Error<S::Error>> {
+        members: Vec<(Aci, Option<ProfileKey>)>,
+    ) -> Result<([u8; 32], Vec<ServiceId>), Error<S::Error>> {
         use libsignal_service::groups_v2::{AccessControl, AccessRequired, GroupCandidate};
 
         let title = title.into();
@@ -1467,7 +1467,10 @@ impl<S: Store> Manager<S, Registered> {
         let group_master_key = GroupMasterKey::new(master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
 
-        let server_public_params = self.state.service_configuration().zkgroup_server_public_params;
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
 
         // Fetch credential for self
         let self_aci = self.state.data.service_ids.aci();
@@ -1479,15 +1482,22 @@ impl<S: Store> Manager<S, Registered> {
         // Build member candidates with credentials
         let mut candidates = Vec::with_capacity(members.len());
         for (aci, profile_key) in members {
-            let credential = match self
-                .get_profile_credential(aci, profile_key, &server_public_params)
-                .await
-            {
-                Ok(cred) => Some(cred),
-                Err(e) => {
-                    warn!(aci = %aci.service_id_string(), "Failed to get credential, member will be invited: {}", e);
-                    None
+            let credential = if let Some(profile_key) = profile_key {
+                // Have profile key -- try to get credential for full membership
+                match self
+                    .get_profile_credential(aci, profile_key, &server_public_params)
+                    .await
+                {
+                    Ok(cred) => Some(cred),
+                    Err(e) => {
+                        warn!(aci = %aci.service_id_string(), "Failed to get credential, member will be invited: {}", e);
+                        None
+                    }
                 }
+            } else {
+                // No profile key -- member will be added as pending/invited
+                info!(aci = %aci.service_id_string(), "No profile key, member will be invited");
+                None
             };
             candidates.push(GroupCandidate {
                 service_id: aci.into(),
@@ -1517,7 +1527,7 @@ impl<S: Store> Manager<S, Registered> {
         // Save the created group to local store
         let presage_group: crate::model::groups::Group = created_group.into();
         self.store
-            .save_group(master_key_bytes.try_into().unwrap(), presage_group)
+            .save_group(master_key_bytes, presage_group)
             .await?;
 
         // Notify all members about the new group (GV2 protocol Step 10).
@@ -1528,7 +1538,6 @@ impl<S: Store> Manager<S, Registered> {
                 master_key: Some(master_key_bytes.to_vec()),
                 revision: Some(0),
                 group_change: None,
-                ..Default::default()
             }),
             ..Default::default()
         };
@@ -1538,12 +1547,79 @@ impl<S: Store> Manager<S, Registered> {
             .expect("Time went backwards")
             .as_millis() as u64;
 
-        self.send_message_to_group(&master_key_bytes, group_update, timestamp)
-            .await?;
+        // Don't let group message failure prevent pending member notifications.
+        // Use a timeout because the websocket may be dead, causing send to hang forever.
+        match tokio::time::timeout(
+            Duration::from_secs(15),
+            self.send_message_to_group(&master_key_bytes, group_update.clone(), timestamp),
+        ).await {
+            Ok(Ok(())) => info!("group announcement sent to full members"),
+            Ok(Err(e)) => warn!("failed to send group announcement (group still created): {}", e),
+            Err(_) => warn!("send_message_to_group timed out after 15s (group still created, continuing to notify pending members)"),
+        }
 
-        info!(group_title = %title, "group created successfully");
+        // Collect pending member ServiceIds for the caller to notify later.
+        // We don't send invite DMs here because the websocket often dies during
+        // group creation, causing sends to hang. The caller should send invites
+        // after this function returns, when the websocket has recovered.
+        let self_aci = self.state.data.service_ids.aci();
+        let pending_members: Vec<ServiceId> = candidates
+            .iter()
+            .filter(|c| c.credential.is_none())
+            .filter_map(|c| {
+                let sid = c.service_id;
+                if sid == ServiceId::from(self_aci) {
+                    None // Exclude self
+                } else {
+                    Some(sid)
+                }
+            })
+            .collect();
 
-        Ok(master_key_bytes)
+        info!(
+            group_title = %title,
+            pending_count = pending_members.len(),
+            "group created successfully, returning pending members for caller to notify"
+        );
+
+        Ok((master_key_bytes, pending_members))
+    }
+
+    /// Send a group invite DM to a member (typically a pending/invited member).
+    ///
+    /// This sends a DataMessage with GroupContextV2 { master_key, revision: 0 }
+    /// which causes the recipient's Signal client to display the group invite.
+    /// Call this after `create_group` returns for each pending member.
+    pub async fn send_group_invite_dm(
+        &mut self,
+        master_key: &[u8; 32],
+        recipient: Aci,
+    ) -> Result<(), Error<S::Error>> {
+        let invite_message = DataMessage {
+            group_v2: Some(GroupContextV2 {
+                master_key: Some(master_key.to_vec()),
+                revision: Some(0),
+                group_change: None,
+            }),
+            ..Default::default()
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+
+        info!(aci = %recipient.service_id_string(), "sending group invite DM");
+
+        self.send_message(
+            recipient,
+            ContentBody::DataMessage(invite_message),
+            timestamp,
+        )
+        .await?;
+
+        info!(aci = %recipient.service_id_string(), "group invite DM sent successfully");
+        Ok(())
     }
 
     /// Fetch or retrieve cached profile credential for a user.
@@ -1576,17 +1652,14 @@ impl<S: Store> Manager<S, Registered> {
         debug!(%uuid, "fetching profile credential from server");
 
         // Need to fetch from server
-        let (context, request) =
-            create_credential_request(server_public_params, aci, &profile_key);
+        let (context, request) = create_credential_request(server_public_params, aci, &profile_key);
 
         let mut identified_ws = self.identified_websocket(false).await?;
         let response = identified_ws
             .retrieve_profile_with_credential(aci, profile_key, &request)
             .await?;
 
-        let credential_response_bytes = response
-            .credential
-            .ok_or(Error::CredentialNotReturned)?;
+        let credential_response_bytes = response.credential.ok_or(Error::CredentialNotReturned)?;
         let credential_response: ExpiringProfileKeyCredentialResponse =
             zkgroup::deserialize(&credential_response_bytes)
                 .map_err(|_| Error::CredentialDeserializationError)?;
@@ -1631,15 +1704,18 @@ impl<S: Store> Manager<S, Registered> {
         &mut self,
         master_key_bytes: &[u8; 32],
         member_aci: Aci,
-        member_profile_key: ProfileKey,
+        member_profile_key: Option<ProfileKey>,
     ) -> Result<(), Error<S::Error>> {
-        use libsignal_service::groups_v2::{Role, GroupOperations};
+        use libsignal_service::groups_v2::{GroupOperations, Role};
 
         info!(aci = %member_aci.service_id_string(), "adding member to group");
 
         let group_master_key = GroupMasterKey::new(*master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
-        let server_public_params = self.state.service_configuration().zkgroup_server_public_params;
+        let server_public_params = self
+            .state
+            .service_configuration()
+            .zkgroup_server_public_params;
 
         // Fetch current group to get revision
         let mut groups_manager = self.groups_manager().await?;
@@ -1648,19 +1724,25 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
         let current_revision = current_group.revision;
 
-        // Fetch credential for the new member
-        let credential = match self
-            .get_profile_credential(member_aci, member_profile_key, &server_public_params)
-            .await
-        {
-            Ok(cred) => Some(cred),
-            Err(e) => {
-                warn!(aci = %member_aci.service_id_string(), "Failed to get credential, member will be invited: {}", e);
-                None
+        // Try to fetch credential if we have a profile key
+        let credential = if let Some(profile_key) = member_profile_key {
+            match self
+                .get_profile_credential(member_aci, profile_key, &server_public_params)
+                .await
+            {
+                Ok(cred) => Some(cred),
+                Err(e) => {
+                    warn!(aci = %member_aci.service_id_string(), "Failed to get credential, member will be invited: {}", e);
+                    None
+                }
             }
+        } else {
+            info!(aci = %member_aci.service_id_string(), "No profile key, member will be invited");
+            None
         };
 
         let group_ops = GroupOperations::new(group_secret_params);
+        let self_aci = self.state.data.service_ids.aci();
 
         debug!(
             current_revision,
@@ -1669,22 +1751,27 @@ impl<S: Store> Manager<S, Registered> {
         );
 
         let actions = if let Some(cred) = credential {
-            // Build add member action with credential presentation
-            let add_action = group_ops
-                .build_add_member_action_with_credential(&cred, Role::Default, &server_public_params);
+            // Build add member action with credential presentation (full member)
+            let add_action = group_ops.build_add_member_action_with_credential(
+                &cred,
+                Role::Default,
+                &server_public_params,
+            );
             libsignal_service::proto::group_change::Actions {
                 revision: current_revision + 1,
                 add_members: vec![add_action],
                 ..Default::default()
             }
         } else {
-            // No credential - add as pending (invite)
+            // No credential - add as pending invite
             let add_pending_action = group_ops
-                .build_add_member_action(member_aci, member_profile_key, Role::Default)
-                .map_err(|_| Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error))?;
+                .build_add_pending_member_action(member_aci, self_aci, Role::Default)
+                .map_err(|_| {
+                    Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error)
+                })?;
             libsignal_service::proto::group_change::Actions {
                 revision: current_revision + 1,
-                add_members: vec![add_pending_action],
+                add_pending_members: vec![add_pending_action],
                 ..Default::default()
             }
         };
@@ -1695,13 +1782,8 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
 
         // Refresh local group state
-        if let Ok(Some(group)) = upsert_group(
-            &self.store,
-            &mut groups_manager,
-            master_key_bytes,
-            &0,
-        )
-        .await
+        if let Ok(Some(group)) =
+            upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await
         {
             debug!(group_title = %group.title, member_count = group.members.len(), "group updated after adding member");
         }
@@ -1751,7 +1833,9 @@ impl<S: Store> Manager<S, Registered> {
         let group_ops = GroupOperations::new(group_secret_params);
         let remove_action = group_ops
             .build_remove_member_action(member_aci)
-            .map_err(|_| Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error))?;
+            .map_err(|_| {
+                Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error)
+            })?;
 
         // Build actions
         let actions = libsignal_service::proto::group_change::Actions {
@@ -1766,13 +1850,8 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
 
         // Refresh local group state
-        if let Ok(Some(group)) = upsert_group(
-            &self.store,
-            &mut groups_manager,
-            master_key_bytes,
-            &0,
-        )
-        .await
+        if let Ok(Some(group)) =
+            upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await
         {
             debug!(group_title = %group.title, member_count = group.members.len(), "group updated after removing member");
         }
@@ -1825,9 +1904,11 @@ impl<S: Store> Manager<S, Registered> {
         // Build actions
         let actions = libsignal_service::proto::group_change::Actions {
             revision: current_revision + 1,
-            modify_title: Some(libsignal_service::proto::group_change::actions::ModifyTitleAction {
-                title: encrypted_title,
-            }),
+            modify_title: Some(
+                libsignal_service::proto::group_change::actions::ModifyTitleAction {
+                    title: encrypted_title,
+                },
+            ),
             ..Default::default()
         };
 
@@ -1837,13 +1918,8 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
 
         // Refresh local group state
-        if let Ok(Some(group)) = upsert_group(
-            &self.store,
-            &mut groups_manager,
-            master_key_bytes,
-            &0,
-        )
-        .await
+        if let Ok(Some(group)) =
+            upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await
         {
             debug!(group_title = %group.title, "group title updated");
         }
@@ -1874,8 +1950,11 @@ impl<S: Store> Manager<S, Registered> {
             .await?;
 
         let group_ops = GroupOperations::new(group_secret_params);
-        let timer = Timer { duration: duration_seconds };
-        let encrypted_timer = group_ops.encrypt_disappearing_message_timer(&timer, &mut rand::rng());
+        let timer = Timer {
+            duration: duration_seconds,
+        };
+        let encrypted_timer =
+            group_ops.encrypt_disappearing_message_timer(&timer, &mut rand::rng());
 
         let actions = libsignal_service::proto::group_change::Actions {
             revision: current_group.revision + 1,
@@ -1891,7 +1970,9 @@ impl<S: Store> Manager<S, Registered> {
             .modify_group(&mut rand::rng(), group_secret_params, actions)
             .await?;
 
-        if let Ok(Some(group)) = upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await {
+        if let Ok(Some(group)) =
+            upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await
+        {
             debug!(group_title = %group.title, "disappearing messages timer updated");
         }
 
@@ -1938,7 +2019,9 @@ impl<S: Store> Manager<S, Registered> {
             .modify_group(&mut rand::rng(), group_secret_params, actions)
             .await?;
 
-        if let Ok(Some(group)) = upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await {
+        if let Ok(Some(group)) =
+            upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await
+        {
             debug!(group_title = %group.title, "group description updated");
         }
 
@@ -1989,7 +2072,9 @@ impl<S: Store> Manager<S, Registered> {
             .modify_group(&mut rand::rng(), group_secret_params, actions)
             .await?;
 
-        if let Ok(Some(group)) = upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await {
+        if let Ok(Some(group)) =
+            upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await
+        {
             debug!(group_title = %group.title, "group access control updated");
         }
 
@@ -2030,7 +2115,9 @@ impl<S: Store> Manager<S, Registered> {
             .modify_group(&mut rand::rng(), group_secret_params, actions)
             .await?;
 
-        if let Ok(Some(group)) = upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await {
+        if let Ok(Some(group)) =
+            upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await
+        {
             debug!(group_title = %group.title, "group announcements only updated");
         }
 

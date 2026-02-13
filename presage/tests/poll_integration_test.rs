@@ -15,11 +15,7 @@
 
 #[cfg(test)]
 mod poll_integration_tests {
-    use presage::{
-        Manager,
-        libsignal_service::prelude::Uuid,
-        model::identity::OnNewIdentity,
-    };
+    use presage::{libsignal_service::prelude::Uuid, model::identity::OnNewIdentity, Manager};
     use presage_store_sqlite::SqliteStore;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,7 +43,9 @@ mod poll_integration_tests {
     #[ignore] // Requires real Signal account and network access
     async fn test_send_poll() -> anyhow::Result<()> {
         let Some((db_path, master_key, _aci)) = get_test_config() else {
-            println!("Skipping test: Set TEST_SIGNAL_DB_PATH, TEST_GROUP_MASTER_KEY, TEST_YOUR_ACI");
+            println!(
+                "Skipping test: Set TEST_SIGNAL_DB_PATH, TEST_GROUP_MASTER_KEY, TEST_YOUR_ACI"
+            );
             return Ok(());
         };
 
@@ -64,12 +62,14 @@ mod poll_integration_tests {
             "Async/Await".to_string(),
         ];
 
-        manager.send_poll(
-            &master_key,
-            question,
-            options,
-            false, // single choice
-        ).await?;
+        manager
+            .send_poll(
+                &master_key,
+                question,
+                options,
+                false, // single choice
+            )
+            .await?;
 
         println!("✅ Poll sent successfully");
         Ok(())
@@ -79,7 +79,9 @@ mod poll_integration_tests {
     #[ignore] // Requires real Signal account and network access
     async fn test_vote_on_poll() -> anyhow::Result<()> {
         let Some((db_path, master_key, aci)) = get_test_config() else {
-            println!("Skipping test: Set TEST_SIGNAL_DB_PATH, TEST_GROUP_MASTER_KEY, TEST_YOUR_ACI");
+            println!(
+                "Skipping test: Set TEST_SIGNAL_DB_PATH, TEST_GROUP_MASTER_KEY, TEST_YOUR_ACI"
+            );
             return Ok(());
         };
 
@@ -99,12 +101,14 @@ mod poll_integration_tests {
         let mut manager = Manager::load_registered(store).await?;
 
         // Vote on the poll (select option 0)
-        manager.vote_on_poll(
-            &master_key,
-            aci.into(),
-            poll_timestamp,
-            vec![0], // Select first option
-        ).await?;
+        manager
+            .vote_on_poll(
+                &master_key,
+                aci.into(),
+                poll_timestamp,
+                vec![0], // Select first option
+            )
+            .await?;
 
         println!("✅ Vote cast successfully");
         Ok(())
@@ -114,7 +118,9 @@ mod poll_integration_tests {
     #[ignore] // Requires real Signal account and network access
     async fn test_terminate_poll() -> anyhow::Result<()> {
         let Some((db_path, master_key, _aci)) = get_test_config() else {
-            println!("Skipping test: Set TEST_SIGNAL_DB_PATH, TEST_GROUP_MASTER_KEY, TEST_YOUR_ACI");
+            println!(
+                "Skipping test: Set TEST_SIGNAL_DB_PATH, TEST_GROUP_MASTER_KEY, TEST_YOUR_ACI"
+            );
             return Ok(());
         };
 
@@ -144,7 +150,9 @@ mod poll_integration_tests {
     #[ignore] // Requires real Signal account and network access
     async fn test_full_poll_lifecycle() -> anyhow::Result<()> {
         let Some((db_path, master_key, aci)) = get_test_config() else {
-            println!("Skipping test: Set TEST_SIGNAL_DB_PATH, TEST_GROUP_MASTER_KEY, TEST_YOUR_ACI");
+            println!(
+                "Skipping test: Set TEST_SIGNAL_DB_PATH, TEST_GROUP_MASTER_KEY, TEST_YOUR_ACI"
+            );
             return Ok(());
         };
 
@@ -159,34 +167,32 @@ mod poll_integration_tests {
             "Test Poll {} - Pick a number",
             SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs()
         );
-        let options = vec![
-            "One".to_string(),
-            "Two".to_string(),
-            "Three".to_string(),
-        ];
+        let options = vec!["One".to_string(), "Two".to_string(), "Three".to_string()];
 
-        let poll_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)?
-            .as_millis() as u64;
+        let poll_timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
 
-        manager.send_poll(
-            &master_key,
-            question,
-            options,
-            true, // allow multiple
-        ).await?;
+        manager
+            .send_poll(
+                &master_key,
+                question,
+                options,
+                true, // allow multiple
+            )
+            .await?;
         println!("✅ Step 1: Poll created at timestamp {}", poll_timestamp);
 
         // Wait a moment for the message to be sent
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         // 2. Vote on the poll
-        manager.vote_on_poll(
-            &master_key,
-            aci.into(),
-            poll_timestamp,
-            vec![0, 2], // Select options 0 and 2
-        ).await?;
+        manager
+            .vote_on_poll(
+                &master_key,
+                aci.into(),
+                poll_timestamp,
+                vec![0, 2], // Select options 0 and 2
+            )
+            .await?;
         println!("✅ Step 2: Vote cast on poll");
 
         // Wait a moment
