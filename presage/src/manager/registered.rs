@@ -1992,6 +1992,27 @@ impl<S: Store> Manager<S, Registered> {
     /// manager.remove_group_member(&master_key_bytes, member_aci).await.unwrap();
     /// # }
     /// ```
+    /// Leave a Signal group
+    ///
+    /// Removes the bot from the specified group. Uses the same mechanism as
+    /// remove_group_member() but removes self.
+    ///
+    /// # Arguments
+    /// * `master_key_bytes` - The group's master key (32 bytes)
+    ///
+    /// # Returns
+    /// * `Ok(())` on success
+    /// * `Err(Error)` if the operation fails
+    pub async fn leave_group(&mut self, master_key_bytes: &[u8; 32]) -> Result<(), Error<S::Error>> {
+        // Get our own ACI and convert to Aci type
+        let our_aci: Aci = self.state.data.service_ids.aci.into();
+        
+        info!(aci = %our_aci.service_id_string(), group = %hex::encode(master_key_bytes), "leaving group");
+        
+        // Remove ourselves from the group
+        self.remove_group_member(master_key_bytes, our_aci).await
+    }
+
     pub async fn remove_group_member(
         &mut self,
         master_key_bytes: &[u8; 32],
