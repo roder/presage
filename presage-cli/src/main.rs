@@ -180,8 +180,12 @@ enum Cmd {
     },
     #[clap(about = "Send a message")]
     Send {
-        #[clap(long, short = 'u', help = "uuid of the recipient")]
-        uuid: Uuid,
+        #[clap(
+            long, short = 'u',
+            help = "Recipient: a bare UUID (treated as ACI), or prefixed like PNI:<uuid> or ACI:<uuid>",
+            value_parser = parse_service_id,
+        )]
+        recipient: ServiceId,
         #[clap(long, short = 'm', help = "Contents of the message to send")]
         message: String,
         #[clap(long = "attach", help = "Path to a file to attach, can be repeated")]
@@ -292,8 +296,24 @@ enum Cmd {
 }
 
 enum Recipient {
-    Contact(Uuid),
+    Contact(ServiceId),
     Group(GroupMasterKeyBytes),
+}
+
+/// Parse a service ID string: bare UUID (defaults to ACI), or "PNI:<uuid>" / "ACI:<uuid>".
+fn parse_service_id(value: &str) -> anyhow::Result<ServiceId> {
+    // Try prefixed form first (e.g. "PNI:cded956a-..." or "ACI:cded956a-...")
+    if let Some(sid) = ServiceId::parse_from_service_id_string(value) {
+        return Ok(sid);
+    }
+    // Fall back to bare UUID -> ACI
+    let uuid: Uuid = value.parse().map_err(|e| {
+        anyhow!(
+            "Invalid recipient '{}': not a valid UUID or service ID string (PNI:<uuid> / ACI:<uuid>). Error: {}",
+            value, e
+        )
+    })?;
+    Ok(ServiceId::Aci(uuid.into()))
 }
 
 fn parse_group_master_key(value: &str) -> anyhow::Result<GroupMasterKeyBytes> {
@@ -344,8 +364,31 @@ fn init() -> Args {
     Args::parse()
 }
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // The `receive_messages()` async state machine is enormous in debug builds
+    // (deeply nested futures::stream::unfold with ~12 fields in StreamState),
+    // easily exceeding the default 8 MB stack on macOS.
+    //
+    // We spawn the async runtime on a thread with a larger stack, since
+    // LocalSet requires everything to run on one thread.
+    let builder = std::thread::Builder::new()
+        .name("presage-main".into())
+        .stack_size(32 * 1024 * 1024); // 32 MB stack
+
+    let handle = builder.spawn(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to build tokio runtime")
+            .block_on(async_main())
+    })?;
+
+    handle
+        .join()
+        .unwrap_or_else(|e| std::panic::resume_unwind(e))
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let args = init();
 
     let sqlite_db_path = args.sqlite_db_path.unwrap_or_else(|| {
@@ -410,19 +453,27 @@ async fn send<S: Store>(
     println!("done synchronizing, sending your message now!");
 
     match recipient {
-        Recipient::Contact(uuid) => {
-            info!(recipient =% uuid, "sending message to contact");
+        Recipient::Contact(service_id) => {
+            let id_kind = match service_id {
+                ServiceId::Aci(_) => "ACI",
+                ServiceId::Pni(_) => "PNI",
+            };
+            info!(recipient = %service_id.service_id_string(), kind = id_kind, "sending message to contact");
             manager
-                .send_message(ServiceId::Aci(uuid.into()), content_body, timestamp)
+                .send_message(service_id, content_body, timestamp)
                 .await
-                .expect("failed to send message");
+                .context(format!(
+                    "Failed to send message to {} ({})",
+                    service_id.service_id_string(),
+                    id_kind
+                ))?;
         }
         Recipient::Group(master_key) => {
             info!("sending message to group");
             manager
                 .send_message_to_group(&master_key, content_body, timestamp)
                 .await
-                .expect("failed to send message");
+                .context("failed to send message to group")?;
         }
     }
 
@@ -849,7 +900,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             }
         }
         Cmd::Send {
-            uuid,
+            recipient,
             message,
             attachment_filepath,
         } => {
@@ -861,7 +912,7 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
                 ..Default::default()
             };
 
-            send(&mut manager, Recipient::Contact(uuid), data_message).await?;
+            send(&mut manager, Recipient::Contact(recipient), data_message).await?;
         }
         Cmd::SendToGroup {
             message,

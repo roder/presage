@@ -924,10 +924,10 @@ impl<S: Store> Manager<S, Registered> {
         let recipient = recipient.into();
 
         let online_only = false;
-        // TODO: Populate this flag based on the recipient information
-        //
-        // Issue <https://github.com/whisperfish/presage/issues/252>
-        let include_pni_signature = false;
+        // Include our PNI signature when sending to a PNI recipient so the
+        // recipient can link our ACI and PNI identities together.
+        // See <https://github.com/whisperfish/presage/issues/252>
+        let include_pni_signature = matches!(recipient, ServiceId::Pni(_));
         let thread = Thread::Contact(recipient.raw_uuid());
         let mut content_body: ContentBody = message.into();
 
@@ -1020,10 +1020,10 @@ impl<S: Store> Manager<S, Registered> {
     ) -> Result<Option<Aci>, Error<S::Error>> {
         use libsignal_net::chat::test_support::simple_chat_connection;
         use libsignal_net::env::PROD as PROD_ENV;
+        use libsignal_net_chat::api::usernames::UnauthenticatedChatApi;
+        use libsignal_net_chat::api::Unauth;
         use libsignal_net_infra::route::DirectOrProxyMode;
         use libsignal_net_infra::EnableDomainFronting;
-        use libsignal_net_chat::api::Unauth;
-        use libsignal_net_chat::api::usernames::UnauthenticatedChatApi;
         use usernames::Username;
 
         let parsed = Username::new(username).map_err(|e| {
@@ -1068,7 +1068,9 @@ impl<S: Store> Manager<S, Registered> {
         use libsignal_core::E164;
         use libsignal_net::auth::Auth;
         use libsignal_net::cdsi::{CdsiConnection, LookupRequest};
-        use libsignal_net::connect_state::{ConnectState, ConnectionResources, SUGGESTED_CONNECT_CONFIG};
+        use libsignal_net::connect_state::{
+            ConnectState, ConnectionResources, SUGGESTED_CONNECT_CONFIG,
+        };
         use libsignal_net::env::PROD as PROD_ENV;
         use libsignal_net_infra::dns::DnsResolver;
         use libsignal_net_infra::utils::no_network_change_events;
@@ -1092,15 +1094,11 @@ impl<S: Store> Manager<S, Registered> {
         // 2. Set up connection infrastructure
         let connect_state = ConnectState::new(SUGGESTED_CONNECT_CONFIG);
         let network_change_event = no_network_change_events();
-        let static_map = std::collections::HashMap::from([
-            PROD_ENV.cdsi.domain_config.static_fallback(
-                libsignal_net::env::StaticIpOrder::HARDCODED,
-            ),
-        ]);
-        let dns_resolver = DnsResolver::new_with_static_fallback(
-            static_map,
-            &network_change_event,
-        );
+        let static_map = std::collections::HashMap::from([PROD_ENV
+            .cdsi
+            .domain_config
+            .static_fallback(libsignal_net::env::StaticIpOrder::HARDCODED)]);
+        let dns_resolver = DnsResolver::new_with_static_fallback(static_map, &network_change_event);
 
         let connection_resources = ConnectionResources {
             connect_state: &connect_state,
@@ -1114,9 +1112,8 @@ impl<S: Store> Manager<S, Registered> {
         let cdsi_connection = CdsiConnection::connect_with(
             connection_resources,
             libsignal_net_infra::route::DirectOrProxyProvider::direct(
-                cdsi_endpoint.enclave_websocket_provider(
-                    libsignal_net_infra::EnableDomainFronting::No,
-                ),
+                cdsi_endpoint
+                    .enclave_websocket_provider(libsignal_net_infra::EnableDomainFronting::No),
             ),
             cdsi_endpoint.ws_config,
             &cdsi_endpoint.params,
@@ -1153,7 +1150,7 @@ impl<S: Store> Manager<S, Registered> {
             response.records.len(),
             response.debug_permits_used
         );
-        
+
         for (i, record) in response.records.iter().enumerate() {
             tracing::debug!(
                 "CDSI record {}: e164={:?}, aci={:?}, pni={:?}",
@@ -2003,12 +2000,15 @@ impl<S: Store> Manager<S, Registered> {
     /// # Returns
     /// * `Ok(())` on success
     /// * `Err(Error)` if the operation fails
-    pub async fn leave_group(&mut self, master_key_bytes: &[u8; 32]) -> Result<(), Error<S::Error>> {
+    pub async fn leave_group(
+        &mut self,
+        master_key_bytes: &[u8; 32],
+    ) -> Result<(), Error<S::Error>> {
         // Get our own ACI and convert to Aci type
         let our_aci: Aci = self.state.data.service_ids.aci.into();
-        
+
         info!(aci = %our_aci.service_id_string(), group = %hex::encode(master_key_bytes), "leaving group");
-        
+
         // Remove ourselves from the group
         self.remove_group_member(master_key_bytes, our_aci).await
     }
