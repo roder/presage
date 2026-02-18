@@ -422,15 +422,28 @@ impl TryFrom<&Content> for Thread {
 
     fn try_from(content: &Content) -> Result<Self, Self::Error> {
         match &content.body {
-            // [1-1] Message sent by us with another device
+            // [1-1] Message sent by us with another device.
+            // destination_service_id is a service ID string that may be either a
+            // plain ACI UUID ("xxxxxxxx-...") or a PNI-prefixed string
+            // ("PNI:xxxxxxxx-..."). Parse via ServiceId::parse_from_service_id_string
+            // so both variants are handled, then extract the underlying UUID via
+            // raw_uuid(). Thread::Contact(Uuid) is preserved unchanged for full
+            // backwards compatibility with the DB - no schema changes required.
             ContentBody::SynchronizeMessage(SyncMessage {
                 sent:
                     Some(Sent {
-                        destination_service_id: Some(uuid),
+                        destination_service_id: Some(service_id_str),
                         ..
                     }),
                 ..
-            }) => Ok(Self::Contact(Uuid::parse_str(uuid)?)),
+            }) => {
+                let uuid = match ServiceId::parse_from_service_id_string(service_id_str) {
+                    Some(service_id) => service_id.raw_uuid(),
+                    // Fall back to plain UUID parse for any unrecognised format
+                    None => Uuid::parse_str(service_id_str)?,
+                };
+                Ok(Self::Contact(uuid))
+            }
             // [Group] message from somebody else
             ContentBody::DataMessage(DataMessage {
                 group_v2:
