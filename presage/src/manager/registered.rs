@@ -14,7 +14,7 @@ use libsignal_service::{
     content::{Content, ContentBody, DataMessageFlags, Metadata},
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
-    prelude::{phonenumber::PhoneNumber, DeviceId, MessageSenderError, ProtobufMessage, Uuid},
+    prelude::{phonenumber::PhoneNumber, DeviceId, MessageSenderError, ProtobufMessage, ServiceError,Uuid},
     profile_cipher::ProfileCipher,
     proto::{
         data_message::{Delete, PollCreate, PollTerminate, PollVote},
