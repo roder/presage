@@ -236,22 +236,22 @@ enum Cmd {
     CreateGroup {
         #[clap(long, help = "Title of the group")]
         title: String,
-        #[clap(long, short = 'u', help = "Member UUIDs to add (can be repeated)", action = clap::ArgAction::Append)]
-        uuid: Vec<Uuid>,
+        #[clap(long, short = 'u', help = "a bare UUID (treated as ACI), or prefixed like PNI:<uuid> or ACI:<uuid>", action = clap::ArgAction::Append, value_parser = parse_service_id)]
+        uuid: Vec<ServiceId>,
     },
     #[clap(about = "Add members to an existing group")]
     AddMember {
         #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
         master_key: GroupMasterKeyBytes,
-        #[clap(long, short = 'u', help = "UUID of the member to add (can be repeated)", action = clap::ArgAction::Append)]
-        uuid: Vec<Uuid>,
+        #[clap(long, short = 'u', help = "a bare UUID (treated as ACI), or prefixed like PNI:<uuid> or ACI:<uuid> (can be repeated)", action = clap::ArgAction::Append, value_parser = parse_service_id)]
+        uuid: Vec<ServiceId>,
     },
     #[clap(about = "Remove members from an existing group")]
     RemoveMember {
         #[clap(long, short = 'k', help = "Master Key of the V2 group (hex string)", value_parser = parse_group_master_key)]
         master_key: GroupMasterKeyBytes,
-        #[clap(long, short = 'u', help = "UUID of the member to remove (can be repeated)", action = clap::ArgAction::Append)]
-        uuid: Vec<Uuid>,
+        #[clap(long, short = 'u', help = "a bare UUID (treated as ACI), or prefixed like PNI:<uuid> or ACI:<uuid> (can be repeated)", action = clap::ArgAction::Append, value_parser = parse_service_id)]
+        uuid: Vec<ServiceId>,
     },
     #[clap(about = "Resolve a Signal username to an ACI")]
     ResolveUsername {
@@ -1223,36 +1223,53 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
             let mut manager = load_registered_and_receive(store).await?;
 
             let mut members_with_keys = Vec::new();
+            let mut members_without_keys = Vec::new(); // Track PNIs separately
+
             for member_uuid in &uuid {
-                let profile_key = match find_profile_key(&manager, member_uuid).await {
+                let profile_key = match find_profile_key(&manager, &member_uuid.raw_uuid()).await {
                     Ok(pk) => Some(pk),
                     Err(_) => {
                         println!(
                             "No profile key for {} — will be added as pending invite",
-                            member_uuid
+                            &member_uuid.service_id_string()
                         );
                         None
                     }
                 };
-                members_with_keys.push(((*member_uuid).into(), profile_key));
+                if let ServiceId::Aci(aci) = member_uuid {
+                    members_with_keys.push((*aci, profile_key));
+                }
+                if let ServiceId::Pni(pni) = member_uuid {
+                    members_without_keys.push(ServiceId::Pni(*pni));
+                }
             }
 
             let (master_key, pending_members) =
                 manager.create_group(title, members_with_keys).await?;
+
+            let all_pending_members: Vec<ServiceId> = pending_members
+                .iter()
+                .cloned()
+                .chain(members_without_keys)
+                .collect();
+
             println!("Group created successfully!");
             println!("Master key (save this!): {}", hex::encode(master_key));
-            if !pending_members.is_empty() {
+
+            if !all_pending_members.is_empty() {
                 println!(
                     "Sending invite DMs to {} pending members...",
-                    pending_members.len()
+                    all_pending_members.len()
                 );
-                for member_sid in &pending_members {
-                    if let presage::libsignal_service::protocol::ServiceId::Aci(aci) = member_sid {
-                        match manager.send_group_invite_dm(&master_key, *aci).await {
-                            Ok(()) => println!("  Invited: {}", aci.service_id_string()),
-                            Err(e) => {
-                                eprintln!("  Failed to invite {}: {}", aci.service_id_string(), e)
-                            }
+                for member_sid in &all_pending_members {
+                    match manager.send_group_invite_dm(&master_key, *member_sid).await {
+                        Ok(()) => println!("  Invited: {}", member_sid.service_id_string()),
+                        Err(e) => {
+                            eprintln!(
+                                "  Failed to invite {}: {}",
+                                member_sid.service_id_string(),
+                                e
+                            )
                         }
                     }
                 }
@@ -1261,21 +1278,43 @@ async fn run<S: Store>(subcommand: Cmd, store: S) -> anyhow::Result<()> {
         Cmd::AddMember { master_key, uuid } => {
             let mut manager = load_registered_and_receive(store).await?;
 
-            for member_uuid in &uuid {
-                let profile_key = find_profile_key(&manager, member_uuid).await?;
+            for member_sid in &uuid {
+                // Try to look up a profile key when we have an ACI; PNI-only
+                // members are always added as pending invites so no key is needed.
+                let profile_key = match member_sid {
+                    ServiceId::Aci(aci) => {
+                        match find_profile_key(&manager, &Uuid::from(*aci)).await {
+                            Ok(pk) => Some(pk),
+                            Err(_) => {
+                                println!(
+                                    "No profile key for {} — will be added as pending invite",
+                                    member_sid.service_id_string()
+                                );
+                                None
+                            }
+                        }
+                    }
+                    ServiceId::Pni(_) => {
+                        println!(
+                            "PNI-only address {} — will be added as pending invite",
+                            member_sid.service_id_string()
+                        );
+                        None
+                    }
+                };
                 manager
-                    .add_group_member(&master_key, (*member_uuid).into(), Some(profile_key))
+                    .add_group_member(&master_key, *member_sid, profile_key)
                     .await?;
-                println!("Member {} added successfully!", member_uuid);
+                println!("Member {} added successfully!", member_sid.service_id_string());
             }
         }
         Cmd::RemoveMember { master_key, uuid } => {
             let mut manager = load_registered_and_receive(store).await?;
-            for member_uuid in &uuid {
+            for member_sid in &uuid {
                 manager
-                    .remove_group_member(&master_key, (*member_uuid).into())
+                    .remove_group_member(&master_key, *member_sid)
                     .await?;
-                println!("Member {} removed successfully!", member_uuid);
+                println!("Member {} removed successfully!", member_sid.service_id_string());
             }
         }
         Cmd::ResolveUsername { username } => {

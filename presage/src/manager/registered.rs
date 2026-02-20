@@ -14,7 +14,9 @@ use libsignal_service::{
     content::{Content, ContentBody, DataMessageFlags, Metadata},
     groups_v2::{decrypt_group, GroupsManager, InMemoryCredentialsCache},
     messagepipe::{Incoming, MessagePipe, ServiceCredentials},
-    prelude::{phonenumber::PhoneNumber, DeviceId, MessageSenderError, ProtobufMessage, ServiceError,Uuid},
+    prelude::{
+        phonenumber::PhoneNumber, DeviceId, MessageSenderError, ProtobufMessage, ServiceError, Uuid,
+    },
     profile_cipher::ProfileCipher,
     proto::{
         data_message::{Delete, PollCreate, PollTerminate, PollVote},
@@ -428,7 +430,7 @@ impl<S: Store> Manager<S, Registered> {
             return Ok(Some(avatar));
         }
 
-        let mut gm = Box::pin(self.groups_manager()).await?;
+        let mut gm = Box::pin(Box::pin(self.groups_manager())).await?;
         let Some(group) = upsert_group(
             &self.store,
             &mut gm,
@@ -590,7 +592,7 @@ impl<S: Store> Manager<S, Registered> {
             message_receiver: MessageReceiver::new(identified_push_service),
             service_cipher_aci: self.new_service_cipher_aci(),
             service_cipher_pni: self.new_service_cipher_pni(),
-            groups_manager: Box::pin(self.groups_manager()).await?,
+            groups_manager: Box::pin(Box::pin(self.groups_manager())).await?,
             service_ids: self.state.data.service_ids.clone(),
             message_sender: self.new_message_sender().await?,
             master_key: self.master_key().await?,
@@ -1196,7 +1198,7 @@ impl<S: Store> Manager<S, Registered> {
 
         let mut sender = self.new_message_sender().await?;
 
-        let mut groups_manager = Box::pin(self.groups_manager()).await?;
+        let mut groups_manager = Box::pin(Box::pin(self.groups_manager())).await?;
         let Some(group) =
             upsert_group(&self.store, &mut groups_manager, &master_key_bytes, &0).await?
         else {
@@ -1661,7 +1663,7 @@ impl<S: Store> Manager<S, Registered> {
         }
 
         // Create the group on the server using credentials
-        let mut groups_manager = self.groups_manager().await?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let created_group = groups_manager
             .create_group_with_credentials(
                 &mut rand::rng(),
@@ -1748,7 +1750,7 @@ impl<S: Store> Manager<S, Registered> {
     pub async fn send_group_invite_dm(
         &mut self,
         master_key: &[u8; 32],
-        recipient: Aci,
+        recipient: impl Into<ServiceId>,
     ) -> Result<(), Error<S::Error>> {
         let invite_message = DataMessage {
             group_v2: Some(GroupContextV2 {
@@ -1764,16 +1766,17 @@ impl<S: Store> Manager<S, Registered> {
             .expect("Time went backwards")
             .as_millis() as u64;
 
-        info!(aci = %recipient.service_id_string(), "sending group invite DM");
+        let service_id = recipient.into();
+        info!(sid = %service_id.service_id_string(), "sending group invite DM");
 
         self.send_message(
-            recipient,
+            service_id,
             ContentBody::DataMessage(invite_message),
             timestamp,
         )
         .await?;
 
-        info!(aci = %recipient.service_id_string(), "group invite DM sent successfully");
+        info!(sid = %service_id.service_id_string(), "group invite DM sent successfully");
         Ok(())
     }
 
@@ -1838,8 +1841,13 @@ impl<S: Store> Manager<S, Registered> {
     ///
     /// # Arguments
     /// * `master_key_bytes` - The group's 32-byte master key
-    /// * `member_aci` - The ACI of the member to add
-    /// * `member_profile_key` - The profile key of the member to add
+    /// * `member_service_id` - The ACI **or** PNI of the member to add.
+    ///   When an ACI is provided and `member_profile_key` is `Some`, the member
+    ///   is added as a full member with a ZK credential presentation.  In all
+    ///   other cases (no profile key, credential fetch failure, or a PNI is
+    ///   supplied) the member is added as a pending invite.
+    /// * `member_profile_key` - The profile key of the member to add (ignored
+    ///   when `member_service_id` is a PNI, because credentials require an ACI)
     ///
     /// # Returns
     /// * `Ok(())` on success
@@ -1848,22 +1856,23 @@ impl<S: Store> Manager<S, Registered> {
     /// # Example
     /// ```no_run
     /// # use presage::Manager;
+    /// # use libsignal_service::protocol::ServiceId;
     /// # async fn example<S: presage::store::Store>(mut manager: Manager<S, presage::manager::Registered>) {
     /// # let master_key_bytes = [0u8; 32];
-    /// # let member_aci = todo!();
+    /// # let member_service_id: ServiceId = todo!();
     /// # let member_profile_key = todo!();
-    /// manager.add_group_member(&master_key_bytes, member_aci, member_profile_key).await.unwrap();
+    /// manager.add_group_member(&master_key_bytes, member_service_id, member_profile_key).await.unwrap();
     /// # }
     /// ```
     pub async fn add_group_member(
         &mut self,
         master_key_bytes: &[u8; 32],
-        member_aci: Aci,
+        member_service_id: ServiceId,
         member_profile_key: Option<ProfileKey>,
     ) -> Result<(), Error<S::Error>> {
         use libsignal_service::groups_v2::{GroupOperations, Role};
 
-        info!(aci = %member_aci.service_id_string(), "adding member to group");
+        info!(sid = %member_service_id.service_id_string(), "adding member to group");
 
         let group_master_key = GroupMasterKey::new(*master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
@@ -1873,26 +1882,36 @@ impl<S: Store> Manager<S, Registered> {
             .zkgroup_server_public_params;
 
         // Fetch current group to get revision
-        let mut groups_manager = self.groups_manager().await?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let current_group = groups_manager
             .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
             .await?;
         let current_revision = current_group.revision;
 
-        // Try to fetch credential if we have a profile key
-        let credential = if let Some(profile_key) = member_profile_key {
-            match self
-                .get_profile_credential(member_aci, profile_key, &server_public_params)
-                .await
-            {
-                Ok(cred) => Some(cred),
-                Err(e) => {
-                    warn!(aci = %member_aci.service_id_string(), "Failed to get credential, member will be invited: {}", e);
-                    None
+        // Credentials require an ACI.  When we only have a PNI we go straight
+        // to the pending-invite path without attempting a credential fetch.
+        let credential = if let ServiceId::Aci(member_aci) = member_service_id {
+            if let Some(profile_key) = member_profile_key {
+                match self
+                    .get_profile_credential(member_aci, profile_key, &server_public_params)
+                    .await
+                {
+                    Ok(cred) => Some(cred),
+                    Err(e) => {
+                        warn!(
+                            aci = %member_aci.service_id_string(),
+                            "Failed to get credential, member will be invited: {}",
+                            e
+                        );
+                        None
+                    }
                 }
+            } else {
+                info!(aci = %member_aci.service_id_string(), "No profile key, member will be invited");
+                None
             }
         } else {
-            info!(aci = %member_aci.service_id_string(), "No profile key, member will be invited");
+            info!(pni = %member_service_id.service_id_string(), "PNI-only member, will be added as pending invite");
             None
         };
 
@@ -1906,7 +1925,8 @@ impl<S: Store> Manager<S, Registered> {
         );
 
         let actions = if let Some(cred) = credential {
-            // Build add member action with credential presentation (full member)
+            // Build add member action with credential presentation (full member).
+            // Only reachable when member_service_id is an ACI with a valid credential.
             let add_action = group_ops.build_add_member_action_with_credential(
                 &cred,
                 Role::Default,
@@ -1918,9 +1938,10 @@ impl<S: Store> Manager<S, Registered> {
                 ..Default::default()
             }
         } else {
-            // No credential - add as pending invite
+            // No credential (PNI, no profile key, or credential fetch failed) —
+            // add as pending invite.  encrypt_service_id handles both ACI and PNI.
             let add_pending_action = group_ops
-                .build_add_pending_member_action(member_aci, self_aci, Role::Default)
+                .build_add_pending_member_action(member_service_id, self_aci, Role::Default)
                 .map_err(|_| {
                     Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error)
                 })?;
@@ -1948,9 +1969,20 @@ impl<S: Store> Manager<S, Registered> {
 
     /// Removes a member from an existing GV2 group.
     ///
+    /// If the target is a **full member** (accepted invite), a
+    /// `DeleteMemberAction` is sent; the `member_service_id` must be (or
+    /// resolve to) the member's ACI in that case.
+    ///
+    /// If the target is a **pending member** (invite not yet accepted), a
+    /// `DeletePendingMemberAction` is sent instead.  The service ID may be
+    /// an ACI or a PNI, whichever was used at invite time.
+    ///
+    /// Returns `Err(Error::UnknownGroup)` when the service ID is found in
+    /// neither the full-members list nor the pending-members list.
+    ///
     /// # Arguments
     /// * `master_key_bytes` - The group's 32-byte master key
-    /// * `member_aci` - The ACI of the member to remove
+    /// * `member_service_id` - ACI or PNI of the member to remove
     ///
     /// # Returns
     /// * `Ok(())` on success
@@ -1959,10 +1991,11 @@ impl<S: Store> Manager<S, Registered> {
     /// # Example
     /// ```no_run
     /// # use presage::Manager;
+    /// # use libsignal_service::protocol::ServiceId;
     /// # async fn example<S: presage::store::Store>(mut manager: Manager<S, presage::manager::Registered>) {
     /// # let master_key_bytes = [0u8; 32];
-    /// # let member_aci = todo!();
-    /// manager.remove_group_member(&master_key_bytes, member_aci).await.unwrap();
+    /// # let member_service_id: ServiceId = todo!();
+    /// manager.remove_group_member(&master_key_bytes, member_service_id).await.unwrap();
     /// # }
     /// ```
     /// Leave a Signal group
@@ -1986,41 +2019,96 @@ impl<S: Store> Manager<S, Registered> {
         info!(aci = %our_aci.service_id_string(), group = %hex::encode(master_key_bytes), "leaving group");
 
         // Remove ourselves from the group
-        self.remove_group_member(master_key_bytes, our_aci).await
+        self.remove_group_member(master_key_bytes, ServiceId::from(our_aci)).await
     }
 
     pub async fn remove_group_member(
         &mut self,
         master_key_bytes: &[u8; 32],
-        member_aci: Aci,
+        member_service_id: ServiceId,
     ) -> Result<(), Error<S::Error>> {
-        use libsignal_service::groups_v2::GroupOperations;
+        use libsignal_service::groups_v2::{decrypt_group, GroupOperations};
 
-        info!(aci = %member_aci.service_id_string(), "removing member from group");
+        info!(sid = %member_service_id.service_id_string(), "removing member from group");
 
         let group_master_key = GroupMasterKey::new(*master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
 
-        // Fetch current group to get revision
-        let mut groups_manager = self.groups_manager().await?;
+        // Fetch current group to get revision and membership lists
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let current_group = groups_manager
             .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
             .await?;
         let current_revision = current_group.revision;
 
-        // Build remove member action
-        let group_ops = GroupOperations::new(group_secret_params);
-        let remove_action = group_ops
-            .build_remove_member_action(member_aci)
-            .map_err(|_| {
-                Error::ServiceError(libsignal_service::prelude::ServiceError::GroupsV2Error)
-            })?;
+        // Decrypt the group so we can inspect full-member and pending-member lists
+        let decrypted = decrypt_group(master_key_bytes, current_group)?;
 
-        // Build actions
-        let actions = libsignal_service::proto::group_change::Actions {
-            revision: current_revision + 1,
-            delete_members: vec![remove_action],
-            ..Default::default()
+        let group_ops = GroupOperations::new(group_secret_params);
+
+        // Determine which proto action to emit based on where the target appears
+        let actions = if let ServiceId::Aci(target_aci) = member_service_id {
+            // Check full members first (keyed by ACI)
+            if decrypted.members.iter().any(|m| m.aci == target_aci) {
+                debug!(sid = %member_service_id.service_id_string(), "target is a full member — emitting DeleteMemberAction");
+                let remove_action = group_ops
+                    .build_remove_member_action(target_aci)
+                    .map_err(|_| {
+                        Error::ServiceError(
+                            libsignal_service::prelude::ServiceError::GroupsV2Error,
+                        )
+                    })?;
+                libsignal_service::proto::group_change::Actions {
+                    revision: current_revision + 1,
+                    delete_members: vec![remove_action],
+                    ..Default::default()
+                }
+            } else if decrypted
+                .pending_members
+                .iter()
+                .any(|p| p.address == member_service_id)
+            {
+                debug!(sid = %member_service_id.service_id_string(), "target is a pending member (ACI) — emitting DeletePendingMemberAction");
+                let remove_pending_action = group_ops
+                    .build_remove_pending_member_action(member_service_id)
+                    .map_err(|_| {
+                        Error::ServiceError(
+                            libsignal_service::prelude::ServiceError::GroupsV2Error,
+                        )
+                    })?;
+                libsignal_service::proto::group_change::Actions {
+                    revision: current_revision + 1,
+                    delete_pending_members: vec![remove_pending_action],
+                    ..Default::default()
+                }
+            } else {
+                warn!(sid = %member_service_id.service_id_string(), "target not found in full-member or pending-member lists");
+                return Err(Error::UnknownGroup);
+            }
+        } else {
+            // PNI — can only be a pending member (ZK credentials require ACI)
+            if decrypted
+                .pending_members
+                .iter()
+                .any(|p| p.address == member_service_id)
+            {
+                debug!(sid = %member_service_id.service_id_string(), "target is a pending member (PNI) — emitting DeletePendingMemberAction");
+                let remove_pending_action = group_ops
+                    .build_remove_pending_member_action(member_service_id)
+                    .map_err(|_| {
+                        Error::ServiceError(
+                            libsignal_service::prelude::ServiceError::GroupsV2Error,
+                        )
+                    })?;
+                libsignal_service::proto::group_change::Actions {
+                    revision: current_revision + 1,
+                    delete_pending_members: vec![remove_pending_action],
+                    ..Default::default()
+                }
+            } else {
+                warn!(sid = %member_service_id.service_id_string(), "PNI target not found in pending-member list");
+                return Err(Error::UnknownGroup);
+            }
         };
 
         // Modify the group
@@ -2032,7 +2120,11 @@ impl<S: Store> Manager<S, Registered> {
         if let Ok(Some(group)) =
             upsert_group(&self.store, &mut groups_manager, master_key_bytes, &0).await
         {
-            debug!(group_title = %group.title, member_count = group.members.len(), "group updated after removing member");
+            debug!(
+                group_title = %group.title,
+                member_count = group.members.len(),
+                "group updated after removing member"
+            );
         }
 
         Ok(())
@@ -2070,7 +2162,7 @@ impl<S: Store> Manager<S, Registered> {
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
 
         // Fetch current group to get revision
-        let mut groups_manager = self.groups_manager().await?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let current_group = groups_manager
             .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
             .await?;
@@ -2123,7 +2215,7 @@ impl<S: Store> Manager<S, Registered> {
         let group_master_key = GroupMasterKey::new(*master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
 
-        let mut groups_manager = self.groups_manager().await?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let current_group = groups_manager
             .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
             .await?;
@@ -2176,7 +2268,7 @@ impl<S: Store> Manager<S, Registered> {
         let group_master_key = GroupMasterKey::new(*master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
 
-        let mut groups_manager = self.groups_manager().await?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let current_group = groups_manager
             .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
             .await?;
@@ -2227,7 +2319,7 @@ impl<S: Store> Manager<S, Registered> {
         let group_master_key = GroupMasterKey::new(*master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
 
-        let mut groups_manager = self.groups_manager().await?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let current_group = groups_manager
             .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
             .await?;
@@ -2275,7 +2367,7 @@ impl<S: Store> Manager<S, Registered> {
         let group_master_key = GroupMasterKey::new(*master_key_bytes);
         let group_secret_params = GroupSecretParams::derive_from_master_key(group_master_key);
 
-        let mut groups_manager = self.groups_manager().await?;
+        let mut groups_manager = Box::pin(self.groups_manager()).await?;
         let current_group = groups_manager
             .fetch_encrypted_group(&mut rand::rng(), master_key_bytes)
             .await?;
